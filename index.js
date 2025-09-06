@@ -4,7 +4,6 @@ import { Pool } from "pg";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const { title } = req.body ?? {};
 
 app.use(cors({
   origin: true, // разрешаем всех (или укажи конкретные домены)
