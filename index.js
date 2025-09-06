@@ -4,6 +4,7 @@ import { Pool } from "pg";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const { title } = req.body ?? {};
 
 app.use(cors({
   origin: true, // разрешаем всех (или укажи конкретные домены)
@@ -99,11 +100,10 @@ app.post("/orders", async (req, res) => {
     const ua = (req.headers["user-agent"] || "").toString();
 
     const text =
-      `📦 НОВЫЙ ЗАКАЗ\n` +
-      `🍳 ${title.trim()}\n` +
-      `⏰ ${new Date().toLocaleString("ru-RU")}\n` +
-      `🌐 IP: ${ip}\n` +
-      `🧭 UA: ${ua}`;
+  `📦 НОВЫЙ ЗАКАЗ ИЗ RECIPEPAD!\n\n` +
+  `🍳 Блюдо: ${title}\n` +
+  `⏰ Время: ${new Date().toLocaleString('ru-RU')}\n` +
+  `📱 Отправлено с сайта`;
 
     // Если картинка не нужна — можно всегда sendMessage
     // Если захотите отправлять фото URL — меняйте на sendPhoto
