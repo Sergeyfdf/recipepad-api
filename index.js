@@ -80,6 +80,54 @@ app.delete("/recipes/:id", async (req, res) => {
   res.status(204).end();
 });
 
+
+app.post("/orders", async (req, res) => {
+  try {
+    const token = process.env.TG_BOT_TOKEN;
+    const chatId = process.env.TG_CHAT_ID;
+    if (!token || !chatId) {
+      return res.status(500).json({ error: "Telegram creds are not set" });
+    }
+
+    const { title, image } = req.body || {};
+    if (!title || typeof title !== "string" || title.trim().length < 2) {
+      return res.status(400).json({ error: "title is required" });
+    }
+
+    // Доп. инфа: IP/UA (удобно в уведомлении)
+    const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString();
+    const ua = (req.headers["user-agent"] || "").toString();
+
+    const text =
+      `📦 НОВЫЙ ЗАКАЗ\n` +
+      `🍳 ${title.trim()}\n` +
+      `⏰ ${new Date().toLocaleString("ru-RU")}\n` +
+      `🌐 IP: ${ip}\n` +
+      `🧭 UA: ${ua}`;
+
+    // Если картинка не нужна — можно всегда sendMessage
+    // Если захотите отправлять фото URL — меняйте на sendPhoto
+    const tgResp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text })
+    });
+
+    const ok = tgResp.ok;
+    if (!ok) {
+      const body = await tgResp.text();
+      console.error("Telegram error:", body);
+      return res.status(502).json({ error: "telegram failed" });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log("API listening on", PORT);
 });
