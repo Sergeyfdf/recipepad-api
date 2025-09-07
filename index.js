@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { Pool } from "pg";
+import compression from "compression";
 import dns from "dns";
 
 dns.setDefaultResultOrder("ipv4first");
@@ -14,6 +15,9 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
 }));
 app.use(express.json({ limit: "10mb" })); // чтобы json с картинкой тоже пролезал
+app.use(compression());
+
+let RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -45,10 +49,45 @@ ensureSchema().catch(console.error);
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // список рецептов (просто массив Recipe — как у тебя во фронте)
-app.get("/recipes", async (_req, res) => {
-  const { rows } = await pool.query("select id, data from recipes order by updated_at desc");
-  // отдаём только data (как ты и ожидаешь)
-  res.json(rows.map(r => ({ ...r.data, id: r.id })));
+app.get("/recipes", async (req, res) => {
+  try {
+    // Если есть свежий кэш — отдать его (и поддержать If-None-Match)
+    if (RECIPES_CACHE.body && Date.now() - RECIPES_CACHE.ts < 15000) {
+      if (req.headers["if-none-match"] === RECIPES_CACHE.etag) {
+        return res.status(304).end();
+      }
+      res.set("ETag", RECIPES_CACHE.etag);
+      res.set("Last-Modified", RECIPES_CACHE.lastmod);
+      res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
+      return res.type("application/json").send(RECIPES_CACHE.body);
+    }
+
+    // Иначе — читаем из БД
+    const { rows } = await pool.query("select id, data, updated_at from recipes order by updated_at desc");
+    const payload = rows.map(r => ({ ...r.data, id: r.id }));
+    const body = JSON.stringify(payload);
+
+    // Простейший etag: количество + max(updated_at)
+    const count = rows.length;
+    const maxUpdated = rows[0]?.updated_at ? new Date(rows[0].updated_at) : new Date();
+    const etag = `"r${count}-${+maxUpdated}"`;
+    const lastmod = maxUpdated.toUTCString();
+
+    // 304 если совпало
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+
+    // Сохраняем в кэш и отдаём
+    RECIPES_CACHE = { body, etag, lastmod, ts: Date.now() };
+    res.set("ETag", etag);
+    res.set("Last-Modified", lastmod);
+    res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
+    res.type("application/json").send(body);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "internal" });
+  }
 });
 
 // получить 1 рецепт
@@ -97,13 +136,15 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ error: "title is required" });
     }
 
-    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
-    const ua = String(req.headers["user-agent"] || "");
+    const kyivTime = new Date().toLocaleString('uk-UA', {
+      timeZone: 'Europe/Kyiv',
+      hour12: false,
+    });
 
     const text =
       `📦 НОВЫЙ ЗАКАЗ ИЗ RECIPEPAD!\n\n` +
       `🍳 Блюдо: ${title}\n` +
-      `⏰ Время: ${new Date().toLocaleString('ru-RU')}\n` +
+      `⏰ Время: ${new Date().toLocaleString('ua-UA')}\n` +
       `📱 Отправлено с сайта`;
 
     const controller = new AbortController();
