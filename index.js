@@ -136,15 +136,22 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ error: "title is required" });
     }
 
-    const kyivTime = new Date().toLocaleString('uk-UA', {
-      timeZone: 'Europe/Kyiv',
-      hour12: false,
-    });
+    function nowKyiv() {
+      return new Intl.DateTimeFormat('uk-UA', {
+        timeZone: 'Europe/Kyiv',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(new Date());
+    }
 
     const text =
       `📦 НОВЫЙ ЗАКАЗ ИЗ RECIPEPAD!\n\n` +
       `🍳 Блюдо: ${title}\n` +
-      `⏰ Время: ${new Date().toLocaleString('ua-UA')}\n` +
+      `⏰ Время: ${nowKyiv()}\n` +
       `📱 Отправлено с сайта`;
 
     const controller = new AbortController();
