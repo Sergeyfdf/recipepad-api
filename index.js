@@ -1,6 +1,9 @@
 import express from "express";
 import cors from "cors";
 import { Pool } from "pg";
+import dns from "dns";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -83,10 +86,8 @@ app.delete("/recipes/:id", async (req, res) => {
 
 app.post("/orders", async (req, res) => {
   try {
-    // читаем оба варианта имен переменных
     const BOT  = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
     const CHAT = process.env.TELEGRAM_CHAT_ID   || process.env.TG_CHAT_ID;
-
     if (!BOT || !CHAT) {
       return res.status(500).json({ error: "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set" });
     }
@@ -105,23 +106,53 @@ app.post("/orders", async (req, res) => {
       `⏰ Время: ${new Date().toLocaleString('ru-RU')}\n` +
       `📱 Отправлено с сайта`;
 
-    const resp = await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: CHAT, text })
-    });
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), 8000); // 8s таймаут
 
-    const data = await resp.json().catch(async () => ({ raw: await resp.text() }));
+    let resp, data;
+    try {
+      resp = await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: CHAT, text }),
+        signal: controller.signal,
+      });
+      data = await resp.json().catch(async () => ({ raw: await resp.text() }));
+    } finally {
+      clearTimeout(to);
+    }
 
     if (!resp.ok || data?.ok === false) {
-      console.error("Telegram failed", { http: resp.status, data });
+      console.error("Telegram failed", { http: resp?.status, data });
       return res.status(502).json({ error: "telegram_failed", details: data });
     }
 
     return res.json({ ok: true });
   } catch (e) {
-    console.error("orders handler error", e);
+    // Вынесем подробности — очень помогает
+    const cause = e && typeof e === "object" && "cause" in e ? e.cause : null;
+    console.error("orders handler error", {
+      message: String(e),
+      name: e?.name,
+      code: cause?.code,
+      errno: cause?.errno,
+      address: cause?.address,
+      port: cause?.port,
+    });
     return res.status(500).json({ error: "internal", details: String(e) });
+  }
+});
+
+
+app.get("/debug/tg", async (_req, res) => {
+  const BOT  = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+  if (!BOT) return res.status(500).json({ error: "no BOT token" });
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${BOT}/getMe`);
+    const j = await r.json();
+    res.json({ http: r.status, body: j });
+  } catch (e) {
+    res.status(500).json({ error: "fetch_failed", details: String(e) });
   }
 });
 
