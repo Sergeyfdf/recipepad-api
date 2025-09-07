@@ -83,48 +83,48 @@ app.delete("/recipes/:id", async (req, res) => {
 
 app.post("/orders", async (req, res) => {
   try {
-    const token = process.env.TG_BOT_TOKEN;
-    const chatId = process.env.TG_CHAT_ID;
-    if (!token || !chatId) {
-      return res.status(500).json({ error: "Telegram creds are not set" });
+    // читаем оба варианта имен переменных
+    const BOT  = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+    const CHAT = process.env.TELEGRAM_CHAT_ID   || process.env.TG_CHAT_ID;
+
+    if (!BOT || !CHAT) {
+      return res.status(500).json({ error: "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set" });
     }
 
-    const { title, image } = req.body || {};
+    const { title } = req.body ?? {};
     if (!title || typeof title !== "string" || title.trim().length < 2) {
       return res.status(400).json({ error: "title is required" });
     }
 
-    // Доп. инфа: IP/UA (удобно в уведомлении)
-    const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString();
-    const ua = (req.headers["user-agent"] || "").toString();
+    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
+    const ua = String(req.headers["user-agent"] || "");
 
     const text =
-  `📦 НОВЫЙ ЗАКАЗ ИЗ RECIPEPAD!\n\n` +
-  `🍳 Блюдо: ${title}\n` +
-  `⏰ Время: ${new Date().toLocaleString('ru-RU')}\n` +
-  `📱 Отправлено с сайта`;
+      `📦 НОВЫЙ ЗАКАЗ ИЗ RECIPEPAD!\n\n` +
+      `🍳 Блюдо: ${title}\n` +
+      `⏰ Время: ${new Date().toLocaleString('ru-RU')}\n` +
+      `📱 Отправлено с сайта`;
 
-    // Если картинка не нужна — можно всегда sendMessage
-    // Если захотите отправлять фото URL — меняйте на sendPhoto
-    const tgResp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const resp = await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text })
+      body: JSON.stringify({ chat_id: CHAT, text })
     });
 
-    const ok = tgResp.ok;
-    if (!ok) {
-      const body = await tgResp.text();
-      console.error("Telegram error:", body);
-      return res.status(502).json({ error: "telegram failed" });
+    const data = await resp.json().catch(async () => ({ raw: await resp.text() }));
+
+    if (!resp.ok || data?.ok === false) {
+      console.error("Telegram failed", { http: resp.status, data });
+      return res.status(502).json({ error: "telegram_failed", details: data });
     }
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "internal" });
+    console.error("orders handler error", e);
+    return res.status(500).json({ error: "internal", details: String(e) });
   }
 });
+
 
 
 app.listen(PORT, () => {
