@@ -9,10 +9,16 @@ dns.setDefaultResultOrder("ipv4first");
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+
+function getOwner(req) {
+  return String(req.header("X-Owner-Id") || req.query.owner || "").trim();
+}
+
+
 app.use(cors({
   origin: true, // разрешаем всех (или укажи конкретные домены)
   methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma", "X-Owner-Id"],
 }));
 app.use(express.json({ limit: "10mb" })); // чтобы json с картинкой тоже пролезал
 app.use(compression());
@@ -203,6 +209,84 @@ app.get("/debug/tg", async (_req, res) => {
     res.status(500).json({ error: "fetch_failed", details: String(e) });
   }
 });
+
+
+
+
+app.get("/local/recipes", async (req, res) => {
+  const owner = getOwner(req);
+  if (!owner) return res.status(400).json({ error: "owner required" });
+
+  const { rows } = await pool.query(
+    "select id, data from local_recipes where owner=$1 order by updated_at desc",
+    [owner]
+  );
+  res.json(rows.map(r => ({ ...r.data, id: r.id })));
+});
+
+// получить один
+app.get("/local/recipes/:id", async (req, res) => {
+  const owner = getOwner(req);
+  if (!owner) return res.status(400).json({ error: "owner required" });
+
+  const { rows } = await pool.query(
+    "select id, data from local_recipes where owner=$1 and id=$2",
+    [owner, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "not found" });
+  res.json({ ...rows[0].data, id: rows[0].id });
+});
+
+// upsert
+app.put("/local/recipes/:id", async (req, res) => {
+  const owner = getOwner(req);
+  if (!owner) return res.status(400).json({ error: "owner required" });
+  const recipe = req.body?.recipe;
+  if (!recipe || typeof recipe !== "object") {
+    return res.status(400).json({ error: "body.recipe required" });
+  }
+  await pool.query(
+    `insert into local_recipes (owner, id, data) values ($1,$2,$3)
+     on conflict (owner, id) do update set data=excluded.data`,
+    [owner, req.params.id, recipe]
+  );
+  res.json({ ok: true });
+});
+
+// удалить
+app.delete("/local/recipes/:id", async (req, res) => {
+  const owner = getOwner(req);
+  if (!owner) return res.status(400).json({ error: "owner required" });
+  await pool.query("delete from local_recipes where owner=$1 and id=$2", [owner, req.params.id]);
+  res.status(204).end();
+});
+
+// (опционально) массовая миграция в облако
+app.post("/local/recipes/bulk", async (req, res) => {
+  const owner = getOwner(req);
+  if (!owner) return res.status(400).json({ error: "owner required" });
+  const arr = Array.isArray(req.body?.recipes) ? req.body.recipes : [];
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    for (const r of arr) {
+      await client.query(
+        `insert into local_recipes (owner, id, data) values ($1,$2,$3)
+         on conflict (owner, id) do update set data=excluded.data`,
+        [owner, r.id, r]
+      );
+    }
+    await client.query("commit");
+    res.json({ ok: true, count: arr.length });
+  } catch (e) {
+    await client.query("rollback");
+    console.error(e);
+    res.status(500).json({ error: "internal" });
+  } finally {
+    client.release();
+  }
+});
+
 
 
 
