@@ -68,6 +68,27 @@ async function ensureSchema() {
     drop trigger if exists tr_local_recipes_updated on local_recipes;
     create trigger tr_local_recipes_updated before update on local_recipes
       for each row execute procedure set_updated_at();
+
+
+    create table if not exists local_recipes (
+  owner text not null,
+  id    text not null,
+  data  jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (owner, id)
+);
+
+create or replace function set_updated_at_local() returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end $$ language plpgsql;
+
+drop trigger if exists tr_set_updated_at_local on local_recipes;
+create trigger tr_set_updated_at_local
+before update on local_recipes
+for each row execute procedure set_updated_at_local();
   `);
 }
 ensureSchema().catch(err => {
@@ -251,19 +272,29 @@ app.delete("/local/recipes/:id", async (req, res) => {
 app.post("/local/recipes/bulk", async (req, res) => {
   const owner = getOwner(req);
   if (!owner) return res.status(400).json({ error: "owner required" });
+
   const arr = Array.isArray(req.body?.recipes) ? req.body.recipes : [];
+  if (!arr.length) return res.json({ ok: true, count: 0 });
 
   const client = await pool.connect();
   try {
     await client.query("begin");
-    for (const r of arr) {
-      const data = { ...r, id: r.id };
-      await client.query(
-        `insert into local_recipes (owner, id, data) values ($1,$2,$3)
-         on conflict (owner, id) do update set data=excluded.data, updated_at=now()`,
-        [owner, r.id, data]
-      );
-    }
+    // чуть быстрее импорт: риски минимальные для одноразовой миграции
+    await client.query("set local synchronous_commit = off");
+
+    await client.query(
+      `
+      with src as (
+        select (x->>'id')::text as id, x as data
+        from jsonb_array_elements($1::jsonb) as x
+      )
+      insert into local_recipes (owner, id, data)
+      select $2, id, data from src
+      on conflict (owner, id) do update set data = excluded.data
+      `,
+      [JSON.stringify(arr), owner]
+    );
+
     await client.query("commit");
     res.json({ ok: true, count: arr.length });
   } catch (e) {
