@@ -64,7 +64,6 @@ function getOwner(req) {
 }
 
 // простейший кэш списка глобальных рецептов
-let RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
 
 // ---------- MIDDLEWARE ----------
 app.use(cors({
@@ -93,37 +92,13 @@ app.get("/health", async (_req, res) => {
 // список
 app.get("/recipes", async (req, res) => {
   try {
-    // быстрый ответ из кэша до 15с (с поддержкой If-None-Match)
-    if (RECIPES_CACHE.body && Date.now() - RECIPES_CACHE.ts < 15000) {
-      if (req.headers["if-none-match"] === RECIPES_CACHE.etag) {
-        return res.status(304).end();
-      }
-      res.set("ETag", RECIPES_CACHE.etag);
-      res.set("Last-Modified", RECIPES_CACHE.lastmod);
-      res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
-      return res.type("application/json").send(RECIPES_CACHE.body);
-    }
 
     const { rows } = await pool.query(
       "select id, data, updated_at from recipes order by updated_at desc"
     );
     const payload = rows.map(r => ({ ...r.data, id: r.id }));
-    const body = JSON.stringify(payload);
-
-    const count = rows.length;
-    const maxUpdated = rows[0]?.updated_at ? new Date(rows[0].updated_at) : new Date();
-    const etag = `"r${count}-${+maxUpdated}"`;
-    const lastmod = maxUpdated.toUTCString();
-
-    if (req.headers["if-none-match"] === etag) {
-      return res.status(304).end();
-    }
-
-    RECIPES_CACHE = { body, etag, lastmod, ts: Date.now() };
-    res.set("ETag", etag);
-    res.set("Last-Modified", lastmod);
-    res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
-    res.type("application/json").send(body);
+    res.set("Cache-Control", "no-store");
+    res.json(payload);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "internal" });
@@ -137,7 +112,8 @@ app.get("/recipes/:id", async (req, res) => {
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ error: "not found" });
-  res.json({ ...rows[0].data, id: rows[0].id });
+    res.set("Cache-Control", "no-store");
+    res.json({ ...rows[0].data, id: rows[0].id });
 });
 
 // upsert (выложить/обновить)
@@ -181,6 +157,7 @@ app.get("/local/recipes", async (req, res) => {
     "select id, data from local_recipes where owner=$1 order by updated_at desc",
     [owner]
   );
+  res.set("Cache-Control", "no-store");
   res.json(rows.map(r => ({ ...r.data, id: r.id })));
 });
 
