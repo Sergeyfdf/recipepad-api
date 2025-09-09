@@ -16,6 +16,23 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }          // для Neon/Render
 });
 
+
+const CACHE_TTL_MS = 15_000;
+
+const RECIPES_CACHE = {
+  body: "",
+  etag: "",
+  lastmod: "",
+  ts: 0, // unix ms
+};
+
+function invalidateRecipesCache() {
+  RECIPES_CACHE.body = "";
+  RECIPES_CACHE.etag = "";
+  RECIPES_CACHE.lastmod = "";
+  RECIPES_CACHE.ts = 0;
+}
+
 // создаём нужные таблицы/триггеры при старте
 async function ensureSchema() {
   await pool.query(`
@@ -92,13 +109,42 @@ app.get("/health", async (_req, res) => {
 // список
 app.get("/recipes", async (req, res) => {
   try {
+    // быстрый ответ из кэша
+    if (RECIPES_CACHE.body && Date.now() - RECIPES_CACHE.ts < CACHE_TTL_MS) {
+      if (req.headers["if-none-match"] === RECIPES_CACHE.etag) {
+        return res.status(304).end();
+      }
+      res.set("ETag", RECIPES_CACHE.etag);
+      res.set("Last-Modified", RECIPES_CACHE.lastmod);
+      res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
+      return res.type("application/json").send(RECIPES_CACHE.body);
+    }
 
     const { rows } = await pool.query(
       "select id, data, updated_at from recipes order by updated_at desc"
     );
     const payload = rows.map(r => ({ ...r.data, id: r.id }));
-    res.set("Cache-Control", "no-store");
-    res.json(payload);
+    const body = JSON.stringify(payload);
+
+    const count = rows.length;
+    const maxUpdated = rows[0]?.updated_at ? new Date(rows[0].updated_at) : new Date();
+    const etag = `"r${count}-${+maxUpdated}"`;
+    const lastmod = maxUpdated.toUTCString();
+
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+
+    // записываем в кэш (НЕ пересоздаём объект)
+    RECIPES_CACHE.body = body;
+    RECIPES_CACHE.etag = etag;
+    RECIPES_CACHE.lastmod = lastmod;
+    RECIPES_CACHE.ts = Date.now();
+
+    res.set("ETag", etag);
+    res.set("Last-Modified", lastmod);
+    res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=300");
+    res.type("application/json").send(body);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "internal" });
@@ -122,25 +168,19 @@ app.put("/recipes/:id", async (req, res) => {
   if (!recipe || typeof recipe !== "object") {
     return res.status(400).json({ error: "body.recipe required" });
   }
-  // принудительно подставим id из пути
-  const data = { ...recipe, id: req.params.id };
-
   await pool.query(
     `insert into recipes (id, data) values ($1, $2)
-     on conflict (id) do update set data=excluded.data, updated_at=now()`,
-    [req.params.id, data]
+     on conflict (id) do update set data=excluded.data`,
+    [req.params.id, recipe]
   );
-
-  // инвалидируем кэш
-  RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
+  invalidateRecipesCache();
   res.json({ ok: true });
 });
 
 // удалить
 app.delete("/recipes/:id", async (req, res) => {
   await pool.query("delete from recipes where id=$1", [req.params.id]);
-  // инвалидируем кэш
-  RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
+  invalidateRecipesCache();
   res.status(204).end();
 });
 
@@ -235,6 +275,40 @@ app.post("/local/recipes/bulk", async (req, res) => {
   }
 });
 
+
+
+
+
+
+app.get("/recipes/:id/exists", async (req, res) => {
+  const { rows } = await pool.query("select 1 from recipes where id=$1 limit 1", [req.params.id]);
+  res.json({ exists: rows.length > 0 });
+});
+
+// и лучше без кэша на списке/элементе
+app.get("/recipes", async (req, res) => {
+  const { rows } = await pool.query(
+    "select id, data, updated_at from recipes order by updated_at desc"
+  );
+  const payload = rows.map(r => ({ ...r.data, id: r.id }));
+  res.set("Cache-Control", "no-store");
+  res.json(payload);
+});
+
+app.get("/recipes/:id", async (req, res) => {
+  const { rows } = await pool.query("select id, data from recipes where id=$1", [req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: "not found" });
+  res.set("Cache-Control", "no-store");
+  res.json({ ...rows[0].data, id: rows[0].id });
+});
+
+
+
+
+
+
+
+
 // =====================================================================
 // ========================== ЗАКАЗЫ (Telegram) =========================
 // =====================================================================
@@ -252,59 +326,51 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ error: "title is required" });
     }
 
-    function nowKyiv() {
-      return new Intl.DateTimeFormat('uk-UA', {
-        timeZone: 'Europe/Kyiv',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-      }).format(new Date());
-    }
-
     const text =
       `📦 НОВЫЙ ЗАКАЗ ИЗ RECIPEPAD!\n\n` +
       `🍳 Блюдо: ${title}\n` +
-      `⏰ Время: ${nowKyiv()}\n` +
+      `⏰ Время: ${new Date().toLocaleString("uk-UA", { timeZone: "Europe/Kyiv" })}\n` +
       `📱 Отправлено с сайта`;
 
-    const controller = new AbortController();
-    const to = setTimeout(() => controller.abort(), 8000);
-
-    let resp, data;
-    try {
-      resp = await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: CHAT, text }),
-        signal: controller.signal,
-      });
-      data = await resp.json().catch(async () => ({ raw: await resp.text() }));
-    } finally {
-      clearTimeout(to);
+    async function sendWithTimeout(timeoutMs) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const resp = await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: CHAT, text }),
+          signal: controller.signal,
+        });
+        const data = await resp.json().catch(async () => ({ raw: await resp.text() }));
+        return { resp, data };
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
-    if (!resp.ok || data?.ok === false) {
-      console.error("Telegram failed", { http: resp?.status, data });
-      return res.status(502).json({ error: "telegram_failed", details: data });
+    // 2 ретрая с нарастающим таймаутом
+    let lastErr = null;
+    for (const t of [8000, 12000, 15000]) {
+      try {
+        const { resp, data } = await sendWithTimeout(t);
+        if (resp.ok && data?.ok !== false) {
+          return res.json({ ok: true });
+        }
+        lastErr = { http: resp.status, data };
+      } catch (e) {
+        lastErr = e;
+      }
     }
 
-    return res.json({ ok: true });
+    console.warn("telegram_failed", lastErr);
+    return res.status(502).json({ error: "telegram_failed" });
   } catch (e) {
-    const cause = e && typeof e === "object" && "cause" in e ? e.cause : null;
-    console.error("orders handler error", {
-      message: String(e),
-      name: e?.name,
-      code: cause?.code,
-      errno: cause?.errno,
-      address: cause?.address,
-      port: cause?.port,
-    });
-    return res.status(500).json({ error: "internal", details: String(e) });
+    console.error("orders handler error", String(e));
+    return res.status(500).json({ error: "internal" });
   }
 });
+
 
 // быстрая проверка токена бота
 app.get("/debug/tg", async (_req, res) => {
