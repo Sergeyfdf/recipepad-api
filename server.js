@@ -3,6 +3,8 @@ import cors from "cors";
 import compression from "compression";
 import { Pool } from "pg";
 import dns from "dns";
+import crypto from "node:crypto";
+import jwt from "jsonwebtoken";
 
 // чтобы на Render/Neon не было проблем с IPv6
 dns.setDefaultResultOrder("ipv4first");
@@ -89,6 +91,46 @@ drop trigger if exists tr_set_updated_at_local on local_recipes;
 create trigger tr_set_updated_at_local
 before update on local_recipes
 for each row execute procedure set_updated_at_local();
+
+
+create table if not exists recipes (
+      id text primary key,
+      data jsonb not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
+    create table if not exists users (
+      tg_id text primary key,
+      username text,
+      first_name text,
+      last_name text,
+      photo_url text,
+      created_at timestamptz not null default now(),
+      last_login timestamptz not null default now()
+    );
+
+    create table if not exists local_recipes (
+      owner text not null,
+      id text not null,
+      data jsonb not null,
+      updated_at timestamptz not null default now(),
+      primary key (owner, id)
+    );
+
+    create or replace function set_updated_at() returns trigger as $$
+    begin
+      new.updated_at = now(); 
+      return new;
+    end $$ language plpgsql;
+
+    drop trigger if exists tr_set_updated_at on recipes;
+    create trigger tr_set_updated_at before update on recipes
+    for each row execute procedure set_updated_at();
+
+    drop trigger if exists tr_set_updated_at_local on local_recipes;
+    create trigger tr_set_updated_at_local before update on local_recipes
+    for each row execute procedure set_updated_at();
   `);
 }
 ensureSchema().catch(err => {
@@ -99,6 +141,27 @@ ensureSchema().catch(err => {
 function getOwner(req) {
   // заголовок X-Owner-Id предпочтительнее; fallback — query ?owner=
   return String(req.header("X-Owner-Id") || req.query.owner || "").trim();
+}
+
+
+
+
+
+
+function verifyTelegramAuth(data) {
+  const token = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+  if (!token) throw new Error("No TELEGRAM_BOT_TOKEN");
+
+  const { hash, ...rest } = data;
+  const checkString = Object.keys(rest)
+    .sort()
+    .map(k => `${k}=${rest[k]}`)
+    .join('\n');
+
+  const secret = crypto.createHash('sha256').update(token).digest();
+  const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
+
+  return hmac === hash;
 }
 
 // простейший кэш списка глобальных рецептов
@@ -415,6 +478,193 @@ app.get("/debug/tg", async (_req, res) => {
     res.status(500).json({ error: "fetch_failed", details: String(e) });
   }
 });
+
+
+
+
+
+
+
+
+app.post("/auth/telegram", async (req, res) => {
+  try {
+    const data = req.body; // объект, который приходит из виджета
+    if (!verifyTelegramAuth(data)) return res.status(403).json({ error: "bad_signature" });
+
+    const tg_id = String(data.id);
+    await pool.query(`
+      insert into users (tg_id, username, first_name, last_name, photo_url)
+      values ($1,$2,$3,$4,$5)
+      on conflict (tg_id) do update set
+        username = excluded.username,
+        first_name = excluded.first_name,
+        last_login = now(),
+        photo_url = excluded.photo_url
+    `, [tg_id, data.username || null, data.first_name || null, data.last_name || null, data.photo_url || null]);
+
+    const jwtSecret = process.env.JWT_SECRET || "dev-secret";
+    const token = jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, { expiresIn: "90d" });
+
+    res.json({
+      ok: true,
+      jwt: token,
+      ownerId: `tg:${tg_id}`,      // ← это и будем класть в X-Owner-Id
+      profile: {
+        username: data.username,
+        first_name: data.first_name,
+        photo_url: data.photo_url
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+
+import { Telegraf, Markup } from "telegraf";
+
+async function startBot() {
+  const BOT = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+  if (!BOT) return;
+
+  const bot = new Telegraf(BOT);
+
+  // Пагинация: 5 рецептов на страницу
+  const PAGE_SIZE = 5;
+
+  bot.start(async (ctx) => {
+    await ctx.reply(
+      "Привет! Выбирай, что сделать:",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Мои рецепты", "LIST:0")],
+      ])
+    );
+  });
+
+  // Показать список
+  bot.action(/LIST:(\d+)/, async (ctx) => {
+    const page = Number(ctx.match[1] || 0);
+    const owner = `tg:${ctx.from.id}`;
+
+    const { rows } = await pool.query(
+      `select id, data from local_recipes where owner=$1 order by updated_at desc`,
+      [owner]
+    );
+    if (!rows.length) {
+      return ctx.editMessageText("Пока нет рецептов. Добавь их в веб-приложении 👩‍🍳");
+    }
+
+    const from = page * PAGE_SIZE;
+    const slice = rows.slice(from, from + PAGE_SIZE);
+
+    const buttons = slice.map(r =>
+      [Markup.button.callback(r.data.title || r.id, `OPEN:${r.id}:${page}`)]
+    );
+
+    const nav = [];
+    if (page > 0) nav.push(Markup.button.callback("« Назад", `LIST:${page - 1}`));
+    if (from + PAGE_SIZE < rows.length) nav.push(Markup.button.callback("Вперёд »", `LIST:${page + 1}`));
+    if (nav.length) buttons.push(nav);
+
+    await ctx.editMessageText(`Мои рецепты (стр. ${page + 1})`, Markup.inlineKeyboard(buttons));
+  });
+
+  // Открыть рецепт (карточка)
+  bot.action(/OPEN:([^:]+):(\d+)/, async (ctx) => {
+    const id = ctx.match[1];
+    const page = Number(ctx.match[2] || 0);
+    const owner = `tg:${ctx.from.id}`;
+
+    const { rows } = await pool.query(
+      `select data from local_recipes where owner=$1 and id=$2`,
+      [owner, id]
+    );
+    if (!rows.length) {
+      return ctx.answerCbQuery("Не найдено");
+    }
+
+    const r = rows[0].data || {};
+    const title = r.title || "Без названия";
+    const ingredients = (Array.isArray(r.parts) && r.parts.length
+      ? r.parts.flatMap(p => p.ingredients)
+      : r.ingredients) || [];
+    const steps = (Array.isArray(r.parts) && r.parts.length
+      ? r.parts.flatMap(p => p.steps)
+      : r.steps) || [];
+
+    const text =
+      `*${escapeMd(title)}*\n` +
+      (r.description ? `${escapeMd(r.description)}\n\n` : "") +
+      (ingredients.length ? `*Ингредиенты:*\n• ${escapeMd(ingredients.join("\n• "))}\n\n` : "") +
+      (steps.length ? `*Шаги:*\n${escapeMd(steps.map((s,i)=>`${i+1}. ${s}`).join("\n"))}\n` : "");
+
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback("📤 Выложить в глобал", `PUB:${id}:${page}`)],
+      [Markup.button.callback("← К списку", `LIST:${page}`)]
+    ]);
+
+    // если обложка — http(s), пришлём фото; иначе — только текст
+    if (r.cover && /^https?:\/\//i.test(r.cover)) {
+      await ctx.replyWithPhoto(r.cover, { caption: text, parse_mode: "Markdown" , reply_markup: kb.reply_markup });
+    } else {
+      await ctx.editMessageText(text, { parse_mode: "Markdown", ...kb });
+    }
+  });
+
+  // Публикация в глобал
+  bot.action(/PUB:([^:]+):(\d+)/, async (ctx) => {
+    const id = ctx.match[1];
+    const page = Number(ctx.match[2] || 0);
+    const owner = `tg:${ctx.from.id}`;
+
+    const { rows } = await pool.query(
+      `select id, data from local_recipes where owner=$1 and id=$2`,
+      [owner, id]
+    );
+    if (!rows.length) return ctx.answerCbQuery("Не найдено");
+
+    // upsert в recipes (глобал)
+    await pool.query(
+      `insert into recipes (id, data) values ($1,$2)
+       on conflict (id) do update set data=excluded.data`,
+      [id, normalizeForGlobal(rows[0].data)]
+    );
+
+    // обнулим кэш списка глобала (если используешь кэш)
+    RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
+
+    await ctx.answerCbQuery("Опубликовано ✅");
+    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([
+      [Markup.button.callback("← К списку", `LIST:${page}`)]
+    ]).reply_markup);
+  });
+
+  function escapeMd(s="") {
+    return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+  }
+  function normalizeForGlobal(rec) {
+    // приведение к твоей file-схеме: перенос частей/ингредиентов как в фронте
+    const base = {
+      id: rec.id, title: rec.title, description: rec.description || "",
+      cover: rec.cover, createdAt: rec.createdAt || Date.now(),
+      favorite: !!rec.favorite, categories: rec.categories || [], done: !!rec.done,
+      parts: Array.isArray(rec.parts) ? rec.parts : [],
+      ingredients: [], steps: []
+    };
+    if (!Array.isArray(rec.parts) || rec.parts.length === 0) {
+      base.ingredients = Array.isArray(rec.ingredients) ? rec.ingredients : [];
+      base.steps = Array.isArray(rec.steps) ? rec.steps : [];
+    }
+    return base;
+  }
+
+  await bot.launch();
+  console.log("Telegram bot started");
+}
+startBot().catch(console.error);
+
+
 
 // ---------- START ----------
 app.listen(PORT, () => {
