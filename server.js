@@ -13,25 +13,33 @@ dns.setDefaultResultOrder("ipv4first");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const ALLOWED = new Set([
+const ALLOWED_ORIGINS = new Set([
   "https://sergeyfdf.github.io",
   "http://localhost:5173",
   "http://localhost:3000",
 ]);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOWED.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers",
-    "Content-Type, X-Owner-Id, Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+app.use(cors({
+  origin(origin, cb) {
+    // позволяем и прямые вызовы (no origin — например, curl/health)
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Owner-Id",
+    "Cache-Control",
+    "If-None-Match",
+    "If-Modified-Since",
+  ],
+  exposedHeaders: ["ETag","Last-Modified"],
+  maxAge: 600,
+}));
+
+// На всякий случай корректно обрабатываем preflight
+app.options("*", (req, res) => res.sendStatus(204));
 
 app.use(express.json({ limit: "10mb" }));
 // ---------- БАЗА ДАННЫХ ----------
@@ -54,6 +62,14 @@ function invalidateRecipesCache() {
   RECIPES_CACHE.lastmod = "";
   RECIPES_CACHE.ts = 0;
 }
+
+function normStr(x) {
+  if (typeof x !== "string") return null;
+  // убираем опасные невидимые символы и обрезаем
+  const cleaned = x.replace(/[\u0000-\u001F\u007F\uFFFE\uFFFF]/g, "").trim();
+  return cleaned.length ? cleaned : null;
+}
+
 
 // создаём нужные таблицы/триггеры при старте
 async function ensureSchema() {
@@ -565,54 +581,44 @@ function verifyTelegramAuth(payload) {
 }
 
 // ===================== /auth/telegram =====================
-app.post("/auth/telegram", async (req, res) => {
+app.post("/auth/telegram", express.json(), async (req, res) => {
   try {
-    const data = req.body; // объект от виджета Telegram (id, username, first_name, auth_date, hash, ...)
+    const data = req.body;
+
     if (!verifyTelegramAuth(data)) {
       return res.status(403).json({ error: "bad_signature" });
     }
 
     const tg_id = String(data.id);
+    const username   = normStr(data.username);
+    const first_name = normStr(data.first_name);
+    const last_name  = normStr(data.last_name);
+    const photo_url  = normStr(data.photo_url);
 
-    // upsert пользователя
     await pool.query(
-      `
-      insert into users (tg_id, username, first_name, last_name, photo_url)
-      values ($1,$2,$3,$4,$5)
-      on conflict (tg_id) do update set
-        username   = excluded.username,
-        first_name = excluded.first_name,
-        last_login = now(),
-        photo_url  = excluded.photo_url
-      `,
-      [
-        tg_id,
-        data.username || null,
-        data.first_name || null,
-        data.last_name || null,
-        data.photo_url || null,
-      ]
+      `insert into users (tg_id, username, first_name, last_name, photo_url)
+       values ($1,$2,$3,$4,$5)
+       on conflict (tg_id) do update set
+         username   = excluded.username,
+         first_name = excluded.first_name,
+         last_name  = excluded.last_name,
+         photo_url  = excluded.photo_url,
+         last_login = now()`,
+      [tg_id, username, first_name, last_name, photo_url]
     );
 
-    // выдаём JWT (используйте свой секрет в переменных окружения)
     const jwtSecret = process.env.JWT_SECRET || "dev-secret";
-    const token = jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, {
-      expiresIn: "90d",
-    });
+    const token = jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, { expiresIn: "90d" });
 
-    return res.json({
+    res.json({
       ok: true,
       jwt: token,
-      ownerId: `tg:${tg_id}`, // это значение используйте как X-Owner-Id на фронте
-      profile: {
-        username: data.username || null,
-        first_name: data.first_name || null,
-        photo_url: data.photo_url || null,
-      },
+      ownerId: `tg:${tg_id}`,
+      profile: { username, first_name, photo_url }
     });
   } catch (e) {
-    console.error("auth/telegram error:", e);
-    return res.status(500).json({ error: "internal" });
+    console.error("/auth/telegram error:", e);
+    res.status(500).json({ error: "internal" });
   }
 });
 
