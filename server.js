@@ -13,6 +13,30 @@ dns.setDefaultResultOrder("ipv4first");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const corsCfg = {
+  origin: [
+    "https://sergeyfdf.github.io",    // GitHub Pages
+    "http://localhost:5173",          // Vite (если нужно)
+    "http://localhost:3000"           // CRA/Next dev (если нужно)
+  ],
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Cache-Control",
+    "Pragma",
+    "X-Owner-Id",
+    "x-owner-id"
+  ],
+  maxAge: 86400
+};
+
+// CORS ДОЛЖЕН БЫТЬ САМЫМ ПЕРВЫМ МИДДЛВАРОМ
+app.use(cors(corsCfg));
+app.options("*", cors(corsCfg));     // отвечаем на префлайт для всех путей
+
+app.use(express.json({ limit: "10mb" }));
+
 // ---------- БАЗА ДАННЫХ ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // postgres://user:pass@host/db?sslmode=require
