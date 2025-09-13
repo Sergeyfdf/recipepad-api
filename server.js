@@ -38,101 +38,72 @@ function invalidateRecipesCache() {
 // создаём нужные таблицы/триггеры при старте
 async function ensureSchema() {
   await pool.query(`
-    -- глобальные рецепты (публикуемые)
+    -- ============================
+    -- Tables
+    -- ============================
+
+    -- Глобальные (опубликованные) рецепты
     create table if not exists recipes (
-      id text primary key,
-      data jsonb not null,
+      id         text primary key,
+      data       jsonb not null,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
 
-    -- локальные рецепты по владельцу (owner)
+    -- Личные рецепты (по владельцу owner = telegram id)
     create table if not exists local_recipes (
-      owner text not null,
-      id text not null,
-      data jsonb not null,
+      owner      text not null,
+      id         text not null,
+      data       jsonb not null,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now(),
       primary key (owner, id)
     );
 
-    -- общий триггер обновления updated_at
-    create or replace function set_updated_at() returns trigger as $$
+    -- Пользователи Telegram
+    create table if not exists users (
+      tg_id      text primary key,
+      username   text,
+      first_name text,
+      last_name  text,
+      photo_url  text,
+      created_at timestamptz not null default now(),
+      last_login timestamptz not null default now()
+    );
+
+    -- ============================
+    -- Common trigger: touch updated_at
+    -- (используем отдельное имя, чтобы не конфликтовать с тем,
+    -- что уже могло существовать раньше)
+    -- ============================
+
+    create or replace function touch_updated_at() returns trigger as $$
     begin
       new.updated_at = now();
       return new;
     end $$ language plpgsql;
 
-    drop trigger if exists tr_recipes_updated on recipes;
-    create trigger tr_recipes_updated before update on recipes
-      for each row execute procedure set_updated_at();
+    -- триггер для recipes
+    drop trigger if exists tr_touch_updated_at_recipes on recipes;
+    create trigger tr_touch_updated_at_recipes
+      before update on recipes
+      for each row execute procedure touch_updated_at();
 
-    drop trigger if exists tr_local_recipes_updated on local_recipes;
-    create trigger tr_local_recipes_updated before update on local_recipes
-      for each row execute procedure set_updated_at();
+    -- триггер для local_recipes
+    drop trigger if exists tr_touch_updated_at_local_recipes on local_recipes;
+    create trigger tr_touch_updated_at_local_recipes
+      before update on local_recipes
+      for each row execute procedure touch_updated_at();
 
+    -- ============================
+    -- Полезные индексы (опционально)
+    -- ============================
 
-    create table if not exists local_recipes (
-  owner text not null,
-  id    text not null,
-  data  jsonb not null,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  primary key (owner, id)
-);
-
-create or replace function set_updated_at_local() returns trigger as $$
-begin
-  new.updated_at = now();
-  return new;
-end $$ language plpgsql;
-
-drop trigger if exists tr_set_updated_at_local on local_recipes;
-create trigger tr_set_updated_at_local
-before update on local_recipes
-for each row execute procedure set_updated_at_local();
-
-
-create table if not exists recipes (
-      id text primary key,
-      data jsonb not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
-
-    create table if not exists users (
-      tg_id text primary key,
-      username text,
-      first_name text,
-      last_name text,
-      photo_url text,
-      created_at timestamptz not null default now(),
-      last_login timestamptz not null default now()
-    );
-
-    create table if not exists local_recipes (
-      owner text not null,
-      id text not null,
-      data jsonb not null,
-      updated_at timestamptz not null default now(),
-      primary key (owner, id)
-    );
-
-    create or replace function set_updated_at() returns trigger as $$
-    begin
-      new.updated_at = now(); 
-      return new;
-    end $$ language plpgsql;
-
-    drop trigger if exists tr_set_updated_at on recipes;
-    create trigger tr_set_updated_at before update on recipes
-    for each row execute procedure set_updated_at();
-
-    drop trigger if exists tr_set_updated_at_local on local_recipes;
-    create trigger tr_set_updated_at_local before update on local_recipes
-    for each row execute procedure set_updated_at();
+    create index if not exists idx_recipes_updated_at on recipes (updated_at desc);
+    create index if not exists idx_local_recipes_updated_at on local_recipes (updated_at desc);
   `);
 }
+
 ensureSchema().catch(err => {
   console.error("ensureSchema error:", err);
 });
