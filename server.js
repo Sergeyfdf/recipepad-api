@@ -116,35 +116,6 @@ function getOwner(req) {
 
 
 
-
-
-function verifyTelegramAuth(data) {
-  const token = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
-  if (!token) throw new Error("No TELEGRAM_BOT_TOKEN");
-
-  const { hash, ...rest } = data;
-  const checkString = Object.keys(rest)
-    .sort()
-    .map(k => `${k}=${rest[k]}`)
-    .join('\n');
-
-  const secret = crypto.createHash('sha256').update(token).digest();
-  const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
-
-  return hmac === hash;
-}
-
-// простейший кэш списка глобальных рецептов
-
-// ---------- MIDDLEWARE ----------
-app.use(cors({
-  origin: true, // можно перечислить домены через массив/регэксп, если нужно
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma", "X-Owner-Id"]
-}));
-app.use(express.json({ limit: "10mb" })); // для data:URL обложек
-app.use(compression());
-
 // ---------- HEALTH ----------
 app.get("/health", async (_req, res) => {
   try {
