@@ -13,30 +13,29 @@ dns.setDefaultResultOrder("ipv4first");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const corsCfg = {
-  origin: [
-    "https://sergeyfdf.github.io",    // GitHub Pages
-    "http://localhost:5173",          // Vite (если нужно)
-    "http://localhost:3000"           // CRA/Next dev (если нужно)
-  ],
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "Cache-Control",
-    "Pragma",
-    "X-Owner-Id",
-    "x-owner-id"
-  ],
-  maxAge: 86400
-};
+const ALLOWED = new Set([
+  "https://sergeyfdf.github.io",
+  "http://localhost:5173",
+  "http://localhost:3000",
+]);
 
-// CORS ДОЛЖЕН БЫТЬ САМЫМ ПЕРВЫМ МИДДЛВАРОМ
-app.use(cors(corsCfg));
-app.options("*", cors(corsCfg));     // отвечаем на префлайт для всех путей
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Cache-Control, Pragma, X-Owner-Id, x-owner-id"
+  );
+  res.setHeader("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 app.use(express.json({ limit: "10mb" }));
-
 // ---------- БАЗА ДАННЫХ ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // postgres://user:pass@host/db?sslmode=require
