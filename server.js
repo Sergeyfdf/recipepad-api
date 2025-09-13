@@ -107,6 +107,30 @@ ensureSchema().catch(err => {
   console.error("ensureSchema error:", err);
 });
 
+
+
+
+const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+if (!TG_BOT_TOKEN) {
+  console.warn("TELEGRAM_BOT_TOKEN is not set — /auth/telegram will reject all requests.");
+}
+
+// Создаём таблицу users при старте (если ещё нет)
+async function ensureUsersTable() {
+  await pool.query(`
+    create table if not exists users (
+      tg_id      text primary key,
+      username   text,
+      first_name text,
+      last_name  text,
+      photo_url  text,
+      created_at timestamptz not null default now(),
+      last_login timestamptz not null default now()
+    );
+  `);
+}
+ensureUsersTable().catch(console.error);
+
 // ---------- HELPERS ----------
 function getOwner(req) {
   // заголовок X-Owner-Id предпочтительнее; fallback — query ?owner=
@@ -114,6 +138,20 @@ function getOwner(req) {
 }
 
 
+function requireAuth(req, res, next) {
+  try {
+    const h = String(req.headers.authorization || "");
+    const m = h.match(/^Bearer\s+(.+)$/i);
+    if (!m) return res.status(401).json({ error: "no_token" });
+    const token = m[1];
+    const jwtSecret = process.env.JWT_SECRET || "dev-secret";
+    const payload = jwt.verify(token, jwtSecret);
+    req.user = payload; // { sub: "tg:<id>", tg_id: "<id>" }
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "bad_token" });
+  }
+}
 
 
 // ---------- HEALTH ----------
@@ -313,6 +351,40 @@ app.post("/local/recipes/bulk", async (req, res) => {
 
 
 
+app.post("/local/recipes/migrate", requireAuth, async (req, res) => {
+  const to = `tg:${req.user.tg_id}`;              // целевой владелец из токена
+  const from = String(req.body?.from || "").trim(); // старый владелец из фронта
+
+  if (!from || from === to) {
+    return res.status(400).json({ error: "bad_params" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await client.query(
+      `
+      insert into local_recipes (owner, id, data, created_at, updated_at)
+      select $2 as owner, id, data, created_at, updated_at
+      from local_recipes
+      where owner = $1
+      on conflict (owner, id)
+      do update set data = excluded.data, updated_at = excluded.updated_at
+      `,
+      [from, to]
+    );
+    await client.query(`delete from local_recipes where owner=$1`, [from]);
+    await client.query("commit");
+    return res.json({ ok: true, from, to });
+  } catch (e) {
+    await client.query("rollback");
+    console.error("migrate error", e);
+    return res.status(500).json({ error: "internal" });
+  } finally {
+    client.release();
+  }
+});
+
 
 
 app.get("/recipes/:id/exists", async (req, res) => {
@@ -427,44 +499,61 @@ app.get("/debug/tg", async (_req, res) => {
 
 
 
-function verifyTelegramAuth(data) {
-  // data приходит из Telegram Login Widget (authResult)
-  // Должны быть: id, auth_date, hash (+ прочие поля)
-  if (!data || !data.hash || !data.auth_date || !data.id) return false;
+function verifyTelegramAuth(payload) {
+  try {
+    if (!TG_BOT_TOKEN) return false;
+    if (!payload || typeof payload !== "object") return false;
 
-  const botToken =
-    process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || "";
-  if (!botToken) return false;
+    // hash обязателен
+    const receivedHash = String(payload.hash || "");
+    if (!receivedHash) return false;
 
-  // секрет = sha256(bot_token)
-  const secret = crypto.createHash("sha256").update(botToken).digest();
+    // Собираем data_check_string из всех полей, кроме hash
+    const entries = Object.entries(payload)
+      .filter(([k]) => k !== "hash")
+      .map(([k, v]) => [k, String(v)])
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n");
 
-  // формируем data_check_string: key=value\n ... (кроме hash), сортируем по ключу
-  const pairs = Object.keys(data)
-    .filter((k) => k !== "hash")
-    .sort()
-    .map((k) => `${k}=${data[k]}`);
-  const dataCheckString = pairs.join("\n");
+    // secret_key = sha256(bot_token)
+    const secretKey = crypto.createHash("sha256").update(TG_BOT_TOKEN).digest();
 
-  // считаем HMAC-SHA256(data_check_string, secret)
-  const hmac = crypto
-    .createHmac("sha256", secret)
-    .update(dataCheckString)
-    .digest("hex");
+    // hex HMAC
+    const hmac = crypto
+      .createHmac("sha256", secretKey)
+      .update(entries)
+      .digest("hex");
 
-  return hmac === String(data.hash);
+    // сопоставляем хэши (в нижнем регистре)
+    if (hmac !== receivedHash.toLowerCase()) return false;
+
+    // (опционально) проверим давность login (auth_date)
+    const authDate = Number(payload.auth_date || 0);
+    if (authDate > 0) {
+      const now = Math.floor(Date.now() / 1000);
+      const age = now - authDate; // в секундах
+      // 1 сутки — нормально; при желании поменяйте
+      if (age > 24 * 3600) return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ===================== /auth/telegram =====================
 app.post("/auth/telegram", async (req, res) => {
   try {
-    const data = req.body; // объект с Telegram authResult
+    const data = req.body; // объект от виджета Telegram (id, username, first_name, auth_date, hash, ...)
     if (!verifyTelegramAuth(data)) {
       return res.status(403).json({ error: "bad_signature" });
     }
 
     const tg_id = String(data.id);
 
+    // upsert пользователя
     await pool.query(
       `
       insert into users (tg_id, username, first_name, last_name, photo_url)
@@ -474,7 +563,7 @@ app.post("/auth/telegram", async (req, res) => {
         first_name = excluded.first_name,
         last_login = now(),
         photo_url  = excluded.photo_url
-    `,
+      `,
       [
         tg_id,
         data.username || null,
@@ -484,15 +573,16 @@ app.post("/auth/telegram", async (req, res) => {
       ]
     );
 
+    // выдаём JWT (используйте свой секрет в переменных окружения)
     const jwtSecret = process.env.JWT_SECRET || "dev-secret";
     const token = jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, {
       expiresIn: "90d",
     });
 
-    res.json({
+    return res.json({
       ok: true,
       jwt: token,
-      ownerId: `tg:${tg_id}`, // это клади в X-Owner-Id на фронте
+      ownerId: `tg:${tg_id}`, // это значение используйте как X-Owner-Id на фронте
       profile: {
         username: data.username || null,
         first_name: data.first_name || null,
@@ -500,8 +590,8 @@ app.post("/auth/telegram", async (req, res) => {
       },
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "internal" });
+    console.error("auth/telegram error:", e);
+    return res.status(500).json({ error: "internal" });
   }
 });
 
