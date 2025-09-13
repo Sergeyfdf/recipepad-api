@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import dns from "dns";
 import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
+import { Telegraf, Markup } from "telegraf";
 
 // чтобы на Render/Neon не было проблем с IPv6
 dns.setDefaultResultOrder("ipv4first");
@@ -21,12 +22,10 @@ const pool = new Pool({
 
 const CACHE_TTL_MS = 15_000;
 
-const RECIPES_CACHE = {
-  body: "",
-  etag: "",
-  lastmod: "",
-  ts: 0, // unix ms
-};
+let RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
+
+
+
 
 function invalidateRecipesCache() {
   RECIPES_CACHE.body = "";
@@ -457,34 +456,77 @@ app.get("/debug/tg", async (_req, res) => {
 
 
 
+function verifyTelegramAuth(data) {
+  // data приходит из Telegram Login Widget (authResult)
+  // Должны быть: id, auth_date, hash (+ прочие поля)
+  if (!data || !data.hash || !data.auth_date || !data.id) return false;
+
+  const botToken =
+    process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || "";
+  if (!botToken) return false;
+
+  // секрет = sha256(bot_token)
+  const secret = crypto.createHash("sha256").update(botToken).digest();
+
+  // формируем data_check_string: key=value\n ... (кроме hash), сортируем по ключу
+  const pairs = Object.keys(data)
+    .filter((k) => k !== "hash")
+    .sort()
+    .map((k) => `${k}=${data[k]}`);
+  const dataCheckString = pairs.join("\n");
+
+  // считаем HMAC-SHA256(data_check_string, secret)
+  const hmac = crypto
+    .createHmac("sha256", secret)
+    .update(dataCheckString)
+    .digest("hex");
+
+  return hmac === String(data.hash);
+}
+
+// ===================== /auth/telegram =====================
 app.post("/auth/telegram", async (req, res) => {
   try {
-    const data = req.body; // объект, который приходит из виджета
-    if (!verifyTelegramAuth(data)) return res.status(403).json({ error: "bad_signature" });
+    const data = req.body; // объект с Telegram authResult
+    if (!verifyTelegramAuth(data)) {
+      return res.status(403).json({ error: "bad_signature" });
+    }
 
     const tg_id = String(data.id);
-    await pool.query(`
+
+    await pool.query(
+      `
       insert into users (tg_id, username, first_name, last_name, photo_url)
       values ($1,$2,$3,$4,$5)
       on conflict (tg_id) do update set
-        username = excluded.username,
+        username   = excluded.username,
         first_name = excluded.first_name,
         last_login = now(),
-        photo_url = excluded.photo_url
-    `, [tg_id, data.username || null, data.first_name || null, data.last_name || null, data.photo_url || null]);
+        photo_url  = excluded.photo_url
+    `,
+      [
+        tg_id,
+        data.username || null,
+        data.first_name || null,
+        data.last_name || null,
+        data.photo_url || null,
+      ]
+    );
 
     const jwtSecret = process.env.JWT_SECRET || "dev-secret";
-    const token = jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, { expiresIn: "90d" });
+    const token = jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, {
+      expiresIn: "90d",
+    });
 
     res.json({
       ok: true,
       jwt: token,
-      ownerId: `tg:${tg_id}`,      // ← это и будем класть в X-Owner-Id
+      ownerId: `tg:${tg_id}`, // это клади в X-Owner-Id на фронте
       profile: {
-        username: data.username,
-        first_name: data.first_name,
-        photo_url: data.photo_url
-      }
+        username: data.username || null,
+        first_name: data.first_name || null,
+        photo_url: data.photo_url || null,
+      },
     });
   } catch (e) {
     console.error(e);
@@ -492,136 +534,168 @@ app.post("/auth/telegram", async (req, res) => {
   }
 });
 
-
-import { Telegraf, Markup } from "telegraf";
-
+// ===================== Telegram Bot (Telegraf) =====================
 async function startBot() {
   const BOT = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
-  if (!BOT) return;
+  if (!BOT) {
+    console.warn("TELEGRAM_BOT_TOKEN is not set — bot is disabled.");
+    return;
+  }
 
   const bot = new Telegraf(BOT);
-
-  // Пагинация: 5 рецептов на страницу
   const PAGE_SIZE = 5;
 
   bot.start(async (ctx) => {
     await ctx.reply(
-      "Привет! Выбирай, что сделать:",
-      Markup.inlineKeyboard([
-        [Markup.button.callback("Мои рецепты", "LIST:0")],
-      ])
+      "Привет! Выбирай действие:",
+      Markup.inlineKeyboard([[Markup.button.callback("Мои рецепты", "LIST:0")]])
     );
   });
 
-  // Показать список
+  // Список рецептов (постранично)
   bot.action(/LIST:(\d+)/, async (ctx) => {
-    const page = Number(ctx.match[1] || 0);
-    const owner = `tg:${ctx.from.id}`;
+    try {
+      const page = Number(ctx.match[1] || 0);
+      const owner = `tg:${ctx.from.id}`;
 
-    const { rows } = await pool.query(
-      `select id, data from local_recipes where owner=$1 order by updated_at desc`,
-      [owner]
-    );
-    if (!rows.length) {
-      return ctx.editMessageText("Пока нет рецептов. Добавь их в веб-приложении 👩‍🍳");
+      const { rows } = await pool.query(
+        `select id, data from local_recipes where owner=$1 order by updated_at desc`,
+        [owner]
+      );
+
+      if (!rows.length) {
+        return ctx.editMessageText("Пока нет рецептов. Добавь их в веб-приложении 👩‍🍳");
+      }
+
+      const from = page * PAGE_SIZE;
+      const slice = rows.slice(from, from + PAGE_SIZE);
+
+      const buttons = slice.map((r) => [
+        Markup.button.callback(r.data?.title || r.id, `OPEN:${r.id}:${page}`),
+      ]);
+
+      const nav = [];
+      if (page > 0) nav.push(Markup.button.callback("« Назад", `LIST:${page - 1}`));
+      if (from + PAGE_SIZE < rows.length)
+        nav.push(Markup.button.callback("Вперёд »", `LIST:${page + 1}`));
+      if (nav.length) buttons.push(nav);
+
+      await ctx.editMessageText(
+        `Мои рецепты (стр. ${page + 1}/${Math.ceil(rows.length / PAGE_SIZE)})`,
+        Markup.inlineKeyboard(buttons)
+      );
+    } catch (e) {
+      console.error("LIST action error:", e);
+      try { await ctx.answerCbQuery("Ошибка"); } catch {}
     }
-
-    const from = page * PAGE_SIZE;
-    const slice = rows.slice(from, from + PAGE_SIZE);
-
-    const buttons = slice.map(r =>
-      [Markup.button.callback(r.data.title || r.id, `OPEN:${r.id}:${page}`)]
-    );
-
-    const nav = [];
-    if (page > 0) nav.push(Markup.button.callback("« Назад", `LIST:${page - 1}`));
-    if (from + PAGE_SIZE < rows.length) nav.push(Markup.button.callback("Вперёд »", `LIST:${page + 1}`));
-    if (nav.length) buttons.push(nav);
-
-    await ctx.editMessageText(`Мои рецепты (стр. ${page + 1})`, Markup.inlineKeyboard(buttons));
   });
 
-  // Открыть рецепт (карточка)
+  // Открыть карточку рецепта
   bot.action(/OPEN:([^:]+):(\d+)/, async (ctx) => {
-    const id = ctx.match[1];
-    const page = Number(ctx.match[2] || 0);
-    const owner = `tg:${ctx.from.id}`;
+    try {
+      const id = ctx.match[1];
+      const page = Number(ctx.match[2] || 0);
+      const owner = `tg:${ctx.from.id}`;
 
-    const { rows } = await pool.query(
-      `select data from local_recipes where owner=$1 and id=$2`,
-      [owner, id]
-    );
-    if (!rows.length) {
-      return ctx.answerCbQuery("Не найдено");
-    }
+      const { rows } = await pool.query(
+        `select data from local_recipes where owner=$1 and id=$2`,
+        [owner, id]
+      );
+      if (!rows.length) return ctx.answerCbQuery("Не найдено");
 
-    const r = rows[0].data || {};
-    const title = r.title || "Без названия";
-    const ingredients = (Array.isArray(r.parts) && r.parts.length
-      ? r.parts.flatMap(p => p.ingredients)
-      : r.ingredients) || [];
-    const steps = (Array.isArray(r.parts) && r.parts.length
-      ? r.parts.flatMap(p => p.steps)
-      : r.steps) || [];
+      const r = rows[0].data || {};
+      const title = r.title || "Без названия";
 
-    const text =
-      `*${escapeMd(title)}*\n` +
-      (r.description ? `${escapeMd(r.description)}\n\n` : "") +
-      (ingredients.length ? `*Ингредиенты:*\n• ${escapeMd(ingredients.join("\n• "))}\n\n` : "") +
-      (steps.length ? `*Шаги:*\n${escapeMd(steps.map((s,i)=>`${i+1}. ${s}`).join("\n"))}\n` : "");
+      const ingredients =
+        (Array.isArray(r.parts) && r.parts.length
+          ? r.parts.flatMap(p => p.ingredients)
+          : r.ingredients) || [];
+      const steps =
+        (Array.isArray(r.parts) && r.parts.length
+          ? r.parts.flatMap(p => p.steps)
+          : r.steps) || [];
 
-    const kb = Markup.inlineKeyboard([
-      [Markup.button.callback("📤 Выложить в глобал", `PUB:${id}:${page}`)],
-      [Markup.button.callback("← К списку", `LIST:${page}`)]
-    ]);
+      const text =
+        `*${escapeMd(title)}*\n` +
+        (r.description ? `${escapeMd(r.description)}\n\n` : "") +
+        (ingredients.length
+          ? `*Ингредиенты:*\n• ${escapeMd(ingredients.join("\n• "))}\n\n`
+          : "") +
+        (steps.length
+          ? `*Шаги:*\n${escapeMd(
+            steps.map((s, i) => `${i + 1}. ${s}`).join("\n")
+            )}\n`
+          : "");
 
-    // если обложка — http(s), пришлём фото; иначе — только текст
-    if (r.cover && /^https?:\/\//i.test(r.cover)) {
-      await ctx.replyWithPhoto(r.cover, { caption: text, parse_mode: "Markdown" , reply_markup: kb.reply_markup });
-    } else {
-      await ctx.editMessageText(text, { parse_mode: "Markdown", ...kb });
+      const kb = Markup.inlineKeyboard([
+        [Markup.button.callback("📤 Выложить в глобал", `PUB:${id}:${page}`)],
+        [Markup.button.callback("← К списку", `LIST:${page}`)],
+      ]);
+
+      if (r.cover && /^https?:\/\//i.test(r.cover)) {
+        await ctx.replyWithPhoto(r.cover, {
+          caption: text,
+          parse_mode: "Markdown",
+          reply_markup: kb.reply_markup,
+        });
+      } else {
+        await ctx.editMessageText(text, { parse_mode: "Markdown", ...kb });
+      }
+    } catch (e) {
+      console.error("OPEN action error:", e);
+      try { await ctx.answerCbQuery("Ошибка"); } catch {}
     }
   });
 
-  // Публикация в глобал
+  // Публикация рецепта в глобал
   bot.action(/PUB:([^:]+):(\d+)/, async (ctx) => {
-    const id = ctx.match[1];
-    const page = Number(ctx.match[2] || 0);
-    const owner = `tg:${ctx.from.id}`;
+    try {
+      const id = ctx.match[1];
+      const page = Number(ctx.match[2] || 0);
+      const owner = `tg:${ctx.from.id}`;
 
-    const { rows } = await pool.query(
-      `select id, data from local_recipes where owner=$1 and id=$2`,
-      [owner, id]
-    );
-    if (!rows.length) return ctx.answerCbQuery("Не найдено");
+      const { rows } = await pool.query(
+        `select id, data from local_recipes where owner=$1 and id=$2`,
+        [owner, id]
+      );
+      if (!rows.length) return ctx.answerCbQuery("Не найдено");
 
-    // upsert в recipes (глобал)
-    await pool.query(
-      `insert into recipes (id, data) values ($1,$2)
-       on conflict (id) do update set data=excluded.data`,
-      [id, normalizeForGlobal(rows[0].data)]
-    );
+      await pool.query(
+        `insert into recipes (id, data) values ($1,$2)
+         on conflict (id) do update set data=excluded.data`,
+        [id, normalizeForGlobal(rows[0].data)]
+      );
 
-    // обнулим кэш списка глобала (если используешь кэш)
-    RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
+      // сбросим кэш, чтобы /recipes отдал свежий список
+      RECIPES_CACHE = { body: "", etag: "", lastmod: "", ts: 0 };
 
-    await ctx.answerCbQuery("Опубликовано ✅");
-    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([
-      [Markup.button.callback("← К списку", `LIST:${page}`)]
-    ]).reply_markup);
+      await ctx.answerCbQuery("Опубликовано ✅");
+      await ctx.editMessageReplyMarkup(
+        Markup.inlineKeyboard([[Markup.button.callback("← К списку", `LIST:${page}`)]]).reply_markup
+      );
+    } catch (e) {
+      console.error("PUB action error:", e);
+      try { await ctx.answerCbQuery("Ошибка публикации"); } catch {}
+    }
   });
 
-  function escapeMd(s="") {
-    return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+  function escapeMd(s = "") {
+    return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
   }
+
   function normalizeForGlobal(rec) {
-    // приведение к твоей file-схеме: перенос частей/ингредиентов как в фронте
     const base = {
-      id: rec.id, title: rec.title, description: rec.description || "",
-      cover: rec.cover, createdAt: rec.createdAt || Date.now(),
-      favorite: !!rec.favorite, categories: rec.categories || [], done: !!rec.done,
+      id: rec.id,
+      title: rec.title,
+      description: rec.description || "",
+      cover: rec.cover,
+      createdAt: rec.createdAt || Date.now(),
+      favorite: !!rec.favorite,
+      categories: rec.categories || [],
+      done: !!rec.done,
       parts: Array.isArray(rec.parts) ? rec.parts : [],
-      ingredients: [], steps: []
+      ingredients: [],
+      steps: [],
     };
     if (!Array.isArray(rec.parts) || rec.parts.length === 0) {
       base.ingredients = Array.isArray(rec.ingredients) ? rec.ingredients : [];
@@ -632,7 +706,12 @@ async function startBot() {
 
   await bot.launch();
   console.log("Telegram bot started");
+
+  // корректное завершение (Render/Heroku и т.п.)
+  process.once("SIGINT", () => bot.stop("SIGINT"));
+  process.once("SIGTERM", () => bot.stop("SIGTERM"));
 }
+
 startBot().catch(console.error);
 
 
