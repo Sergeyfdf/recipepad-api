@@ -19,24 +19,35 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:3000",
 ]);
 
-app.use(cors({
-  origin(origin, cb) {
-    // позволяем и прямые вызовы (no origin — например, curl/health)
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    cb(new Error("Not allowed by CORS"));
-  },
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-Owner-Id",
-    "Cache-Control",
-    "If-None-Match",
-    "If-Modified-Since",
-  ],
-  exposedHeaders: ["ETag","Last-Modified"],
-  maxAge: 600,
-}));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    // базовые
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin"); // важно для кэшей/проксей
+
+    // что разрешаем
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      [
+        "Content-Type",
+        "Authorization",
+        "X-Owner-Id",
+        "Cache-Control",
+        "If-None-Match",
+        "If-Modified-Since",
+      ].join(", ")
+    );
+    res.setHeader("Access-Control-Expose-Headers", "ETag, Last-Modified");
+    res.setHeader("Access-Control-Max-Age", "600");
+  }
+
+  // быстрый ответ на preflight
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+
+  next();
+});
 
 // На всякий случай корректно обрабатываем preflight
 app.options("*", (req, res) => res.sendStatus(204));
