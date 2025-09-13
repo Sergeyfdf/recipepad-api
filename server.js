@@ -37,6 +37,7 @@ app.use((req, res, next) => {
         "Cache-Control",
         "If-None-Match",
         "If-Modified-Since",
+        "Access-Control-Allow-Origin",
       ].join(", ")
     );
     res.setHeader("Access-Control-Expose-Headers", "ETag, Last-Modified");
