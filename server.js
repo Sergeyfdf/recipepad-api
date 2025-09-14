@@ -13,45 +13,35 @@ dns.setDefaultResultOrder("ipv4first");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const ALLOWED_ORIGINS = new Set([
+const ALLOWED_ORIGINS = [
   "https://sergeyfdf.github.io",
   "http://localhost:5173",
   "http://localhost:3000",
-]);
+];
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
-    // базовые
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin"); // важно для кэшей/проксей
+app.use(cors({
+  origin(origin, cb) {
+    // Разрешаем и curl/серверные запросы без Origin
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Owner-Id",
+    "Cache-Control",
+    "If-None-Match",
+    "If-Modified-Since",
+  ],
+  exposedHeaders: ["ETag","Last-Modified"],
+  maxAge: 600,
+  credentials: false, // нам не нужны cookies
+}));
 
-    // что разрешаем
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      [
-        "Content-Type",
-        "Authorization",
-        "X-Owner-Id",
-        "Cache-Control",
-        "If-None-Match",
-        "If-Modified-Since",
-        "Access-Control-Allow-Origin",
-      ].join(", ")
-    );
-    res.setHeader("Access-Control-Expose-Headers", "ETag, Last-Modified");
-    res.setHeader("Access-Control-Max-Age", "600");
-  }
-
-  // быстрый ответ на preflight
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-
-  next();
-});
-
-// На всякий случай корректно обрабатываем preflight
-app.options("*", (req, res) => res.sendStatus(204));
+// Быстрые preflight-ответы на любые пути
+app.options("*", cors());
 
 app.use(express.json({ limit: "10mb" }));
 // ---------- БАЗА ДАННЫХ ----------
@@ -819,4 +809,30 @@ startBot().catch(console.error);
 // ---------- START ----------
 app.listen(PORT, () => {
   console.log(`API on :${PORT}`);
+});
+
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  try {
+    // Если заголовки ещё не отправлены — допишем CORS, чтобы браузер не ругался
+    if (!res.headersSent) {
+      const origin = req.headers.origin;
+      if (origin && ALLOWED_ORIGINS.includes(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+      } else {
+        // можно и '*', т.к. мы не используем credentials
+        res.setHeader("Access-Control-Allow-Origin", "*");
+      }
+      res.setHeader("Access-Control-Expose-Headers", "ETag, Last-Modified");
+    }
+  } catch {}
+  // Единый JSON-ответ об ошибке
+  if (!res.headersSent) {
+    res.status(500).json({ error: "internal" });
+  } else {
+    // если что-то уже отправлялось — завершим
+    res.end();
+  }
 });
