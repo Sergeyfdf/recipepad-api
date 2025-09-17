@@ -6,6 +6,7 @@ import dns from "dns";
 import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import { Telegraf, Markup } from "telegraf";
+import cookieParser from "cookie-parser";
 
 // чтобы на Render/Neon не было проблем с IPv6
 dns.setDefaultResultOrder("ipv4first");
@@ -37,12 +38,12 @@ app.use(cors({
   ],
   exposedHeaders: ["ETag","Last-Modified"],
   maxAge: 600,
-  credentials: false, // нам не нужны cookies
+  credentials: true, // нам не нужны cookies
 }));
 
 // Быстрые preflight-ответы на любые пути
 app.options("*", cors());
-
+app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 // ---------- БАЗА ДАННЫХ ----------
 const pool = new Pool({
