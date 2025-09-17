@@ -63,9 +63,9 @@ function signJwtForTelegram(tg_id) {
 }
 // ========================= SCHEMA =========================
 async function ensureUsersSchema() {
-  // создаём таблицу, если её нет (НО это не меняет существующую)
+  // 1) если таблицы нет — создадим сразу в верной схеме
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
+    CREATE TABLE IF NOT EXISTS public.users (
       tg_id      text PRIMARY KEY,
       username   text,
       first_name text,
@@ -76,37 +76,109 @@ async function ensureUsersSchema() {
     );
   `);
 
-  // добиваем недостающие колонки в уже существующей таблице
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_id      text;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username   text;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name text;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  text;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url  text;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login timestamptz NOT NULL DEFAULT now();`);
+  // 2) на всякий — добавим недостающие колонки (если таблица уже была «кривая»)
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS tg_id      text;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS username   text;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS first_name text;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_name  text;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS photo_url  text;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_login timestamptz NOT NULL DEFAULT now();`);
 
-  // проставим PK, если его нет
+  // 3) убрать явно плохие строки
+  await pool.query(`DELETE FROM public.users WHERE tg_id IS NULL OR tg_id = ''`);
+
+  // 4) дедупликация по tg_id (оставим по одному ряду на tg_id)
+  await pool.query(`
+    DELETE FROM public.users u
+    USING public.users d
+    WHERE u.tg_id = d.tg_id
+      AND u.ctid > d.ctid;
+  `);
+
+  // 5) если нет PK/UNIQUE — добавим UNIQUE (его достаточно для ON CONFLICT)
   await pool.query(`
     DO $$
     BEGIN
       IF NOT EXISTS (
         SELECT 1
-        FROM   information_schema.table_constraints
-        WHERE  table_schema = 'public'
-        AND    table_name   = 'users'
-        AND    constraint_type = 'PRIMARY KEY'
+        FROM   pg_constraint
+        WHERE  conrelid = 'public.users'::regclass
+        AND    conname  = 'users_tg_id_key'
       ) THEN
-        -- если pk нет, добавляем на tg_id
-        EXECUTE 'ALTER TABLE public.users ADD CONSTRAINT users_pkey PRIMARY KEY (tg_id)';
+        ALTER TABLE public.users ADD CONSTRAINT users_tg_id_key UNIQUE (tg_id);
       END IF;
     END$$;
   `);
 }
 
-// вызови это сразу после создания pool, до старта сервера и до работы с /auth
+// вызов в инициализации:
 ensureUsersSchema().catch(err => {
   console.error("ensureUsersSchema error:", err);
 });
+
+
+
+
+
+
+
+async function ensureSchema() {
+  await pool.query(`
+    -- Глобальные (опубликованные) рецепты
+    create table if not exists recipes (
+      id         text primary key,
+      data       jsonb not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
+    -- Личные рецепты (по владельцу owner = telegram id)
+    create table if not exists local_recipes (
+      owner      text not null,
+      id         text not null,
+      data       jsonb not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      primary key (owner, id)
+    );
+
+    -- Пользователи Telegram
+    create table if not exists users (
+      tg_id      text primary key,
+      username   text,
+      first_name text,
+      last_name  text,
+      photo_url  text,
+      created_at timestamptz not null default now(),
+      last_login timestamptz not null default now()
+    );
+
+    -- updated_at триггер
+    create or replace function touch_updated_at() returns trigger as $$
+    begin
+      new.updated_at = now();
+      return new;
+    end $$ language plpgsql;
+
+    drop trigger if exists tr_touch_updated_at_recipes on recipes;
+    create trigger tr_touch_updated_at_recipes
+      before update on recipes
+      for each row execute procedure touch_updated_at();
+
+    drop trigger if exists tr_touch_updated_at_local_recipes on local_recipes;
+    create trigger tr_touch_updated_at_local_recipes
+      before update on local_recipes
+      for each row execute procedure touch_updated_at();
+
+    create index if not exists idx_recipes_updated_at on recipes (updated_at desc);
+    create index if not exists idx_local_recipes_updated_at on local_recipes (updated_at desc);
+  `);
+}
+ensureSchema().catch((err) => {
+  console.error("ensureSchema error:", err);
+});
+
 
 // ========================= UTILS =========================
 function normStr(x) {
@@ -382,9 +454,10 @@ app.post("/auth/telegram/callback", async (req, res) => {
     // upsert в users — теперь колонка tg_id точно есть
     try {
       await pool.query(
-        `INSERT INTO users (tg_id, username, first_name, last_name, photo_url)
+        `INSERT INTO public.users (tg_id, username, first_name, last_name, photo_url)
          VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (tg_id) DO UPDATE SET
+         ON CONFLICT ON CONSTRAINT users_tg_id_key
+         DO UPDATE SET
            username   = EXCLUDED.username,
            first_name = EXCLUDED.first_name,
            last_name  = EXCLUDED.last_name,
