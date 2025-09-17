@@ -63,7 +63,6 @@ function signJwtForTelegram(tg_id) {
 }
 // ========================= SCHEMA =========================
 async function ensureUsersSchema() {
-  // 1) если таблицы нет — создадим сразу в верной схеме
   await pool.query(`
     CREATE TABLE IF NOT EXISTS public.users (
       tg_id      text PRIMARY KEY,
@@ -76,7 +75,6 @@ async function ensureUsersSchema() {
     );
   `);
 
-  // 2) на всякий — добавим недостающие колонки (если таблица уже была «кривая»)
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS tg_id      text;`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS username   text;`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS first_name text;`);
@@ -84,27 +82,35 @@ async function ensureUsersSchema() {
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS photo_url  text;`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_login timestamptz NOT NULL DEFAULT now();`);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='users'
+          AND column_name='password_hash' AND is_nullable='NO'
+      ) THEN
+        EXECUTE 'ALTER TABLE public.users ALTER COLUMN password_hash DROP NOT NULL';
+      END IF;
+    END$$;
+  `);
 
-  // 3) убрать явно плохие строки
+  // убрать пустые tg_id и дубликаты
   await pool.query(`DELETE FROM public.users WHERE tg_id IS NULL OR tg_id = ''`);
-
-  // 4) дедупликация по tg_id (оставим по одному ряду на tg_id)
   await pool.query(`
     DELETE FROM public.users u
     USING public.users d
-    WHERE u.tg_id = d.tg_id
-      AND u.ctid > d.ctid;
+    WHERE u.tg_id = d.tg_id AND u.ctid > d.ctid;
   `);
 
-  // 5) если нет PK/UNIQUE — добавим UNIQUE (его достаточно для ON CONFLICT)
+  // гарантируем уникальность tg_id (достаточно для ON CONFLICT)
   await pool.query(`
     DO $$
     BEGIN
       IF NOT EXISTS (
-        SELECT 1
-        FROM   pg_constraint
-        WHERE  conrelid = 'public.users'::regclass
-        AND    conname  = 'users_tg_id_key'
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='public.users'::regclass
+          AND conname='users_tg_id_key'
       ) THEN
         ALTER TABLE public.users ADD CONSTRAINT users_tg_id_key UNIQUE (tg_id);
       END IF;
