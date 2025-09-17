@@ -781,158 +781,86 @@ app.get("/debug/tg", async (_req, res) => {
   }
 });
 
+
+
+app.post("/auth/telegram/link", requireAuth, async (req, res) => {
+  try {
+    await pool.query(`update users set bot_enabled=true where tg_id=$1`, [String(req.user.tg_id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("link bot failed", e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// отключить доступ бота
+app.post("/auth/telegram/unlink", requireAuth, async (req, res) => {
+  try {
+    await pool.query(`update users set bot_enabled=false where tg_id=$1`, [String(req.user.tg_id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("unlink bot failed", e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
 // =====================================================================
 // =========================== TELEGRAM BOT =============================
 // =====================================================================
 async function startBot() {
   const BOT = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
   if (!BOT) {
-    console.warn("TELERAAM_BOT_TOKEN is not set — bot is disabled.");
+    console.warn("TELEGRAM_BOT_TOKEN is not set — bot is disabled.");
     return;
   }
 
   const bot = new Telegraf(BOT);
+  bot.use(async (ctx, next) => {
+    try {
+      if (!ctx.from) return; // например, канал/сервисное
+      const tgId = String(ctx.from.id);
+      const { rows } = await pool.query(
+        `select bot_enabled from users where tg_id = $1`,
+        [tgId]
+      );
+      // По умолчанию считаем, что доступ есть (true), если записи нет.
+      // Если хочешь строго — поставь const allowed = !!rows[0]?.bot_enabled;
+      const allowed = rows.length ? rows[0].bot_enabled !== false : true;
+  
+      if (!allowed) {
+        await ctx.reply(
+          "Ваш Telegram отвязан от веб-аккаунта. " +
+          "Чтобы снова включить доступ, зайдите на сайт и включите «Доступ бота»."
+        );
+        return;
+      }
+    } catch (e) {
+      console.error("bot access check failed:", e);
+      // В случае ошибки лучше не отдавать данные.
+      try { await ctx.reply("Временная ошибка доступа."); } catch {}
+      return;
+    }
+    return next();
+  });
   const PAGE_SIZE = 5;
 
-  bot.start(async (ctx) => {
-    await ctx.reply(
-      "Привет! Выбирай действие:",
-      Markup.inlineKeyboard([[Markup.button.callback("Мои рецепты", "LIST:0")]])
+  // --- helpers ---------------------------------------------------------
+  async function getPublishedSet(owner) {
+    // какие локальные рецепты этого owner выложены в глобал
+    const { rows } = await pool.query(
+      `select lr.id
+         from local_recipes lr
+         join recipes r on r.id = lr.id
+        where lr.owner = $1`,
+      [owner]
     );
-  });
-
-  bot.action(/LIST:(\d+)/, async (ctx) => {
-    try {
-      const page = Number(ctx.match[1] || 0);
-      const owner = `tg:${ctx.from.id}`;
-
-      const { rows } = await pool.query(
-        `select id, data from local_recipes where owner=$1 order by updated_at desc`,
-        [owner]
-      );
-
-      if (!rows.length) {
-        return ctx.editMessageText(
-          "Пока нет рецептов. Добавь их в веб-приложении 👩‍🍳"
-        );
-      }
-
-      const from = page * PAGE_SIZE;
-      const slice = rows.slice(from, from + PAGE_SIZE);
-
-      const buttons = slice.map((r) => [
-        Markup.button.callback(r.data?.title || r.id, `OPEN:${r.id}:${page}`),
-      ]);
-
-      const nav = [];
-      if (page > 0) nav.push(Markup.button.callback("« Назад", `LIST:${page - 1}`));
-      if (from + PAGE_SIZE < rows.length)
-        nav.push(Markup.button.callback("Вперёд »", `LIST:${page + 1}`));
-      if (nav.length) buttons.push(nav);
-
-      await ctx.editMessageText(
-        `Мои рецепты (стр. ${page + 1}/${Math.ceil(rows.length / PAGE_SIZE)})`,
-        Markup.inlineKeyboard(buttons)
-      );
-    } catch (e) {
-      console.error("LIST action error:", e);
-      try {
-        await ctx.answerCbQuery("Ошибка");
-      } catch {}
-    }
-  });
-
-  bot.action(/OPEN:([^:]+):(\d+)/, async (ctx) => {
-    try {
-      const id = ctx.match[1];
-      const page = Number(ctx.match[2] || 0);
-      const owner = `tg:${ctx.from.id}`;
-
-      const { rows } = await pool.query(
-        `select data from local_recipes where owner=$1 and id=$2`,
-        [owner, id]
-      );
-      if (!rows.length) return ctx.answerCbQuery("Не найдено");
-
-      const r = rows[0].data || {};
-      const title = r.title || "Без названия";
-
-      const ingredients =
-        (Array.isArray(r.parts) && r.parts.length
-          ? r.parts.flatMap((p) => p.ingredients)
-          : r.ingredients) || [];
-      const steps =
-        (Array.isArray(r.parts) && r.parts.length
-          ? r.parts.flatMap((p) => p.steps)
-          : r.steps) || [];
-
-      const text =
-        `*${escapeMd(title)}*\n` +
-        (r.description ? `${escapeMd(r.description)}\n\n` : "") +
-        (ingredients.length
-          ? `*Ингредиенты:*\n• ${escapeMd(ingredients.join("\n• "))}\n\n`
-          : "") +
-        (steps.length
-          ? `*Шаги:*\n${escapeMd(steps.map((s, i) => `${i + 1}. ${s}`).join("\n"))}\n`
-          : "");
-
-      const kb = Markup.inlineKeyboard([
-        [Markup.button.callback("📤 Выложить в глобал", `PUB:${id}:${page}`)],
-        [Markup.button.callback("← К списку", `LIST:${page}`)],
-      ]);
-
-      if (r.cover && /^https?:\/\//i.test(r.cover)) {
-        await ctx.replyWithPhoto(r.cover, {
-          caption: text,
-          parse_mode: "Markdown",
-          reply_markup: kb.reply_markup,
-        });
-      } else {
-        await ctx.editMessageText(text, { parse_mode: "Markdown", ...kb });
-      }
-    } catch (e) {
-      console.error("OPEN action error:", e);
-      try {
-        await ctx.answerCbQuery("Ошибка");
-      } catch {}
-    }
-  });
-
-  bot.action(/PUB:([^:]+):(\d+)/, async (ctx) => {
-    try {
-      const id = ctx.match[1];
-      const page = Number(ctx.match[2] || 0);
-      const owner = `tg:${ctx.from.id}`;
-
-      const { rows } = await pool.query(
-        `select id, data from local_recipes where owner=$1 and id=$2`,
-        [owner, id]
-      );
-      if (!rows.length) return ctx.answerCbQuery("Не найдено");
-
-      await pool.query(
-        `insert into recipes (id, data) values ($1,$2)
-         on conflict (id) do update set data=excluded.data`,
-        [id, normalizeForGlobal(rows[0].data)]
-      );
-
-      await ctx.answerCbQuery("Опубликовано ✅");
-      await ctx.editMessageReplyMarkup(
-        Markup.inlineKeyboard([
-          [Markup.button.callback("← К списку", `LIST:${page}`)],
-        ]).reply_markup
-      );
-    } catch (e) {
-      console.error("PUB action error:", e);
-      try {
-        await ctx.answerCbQuery("Ошибка публикации");
-      } catch {}
-    }
-  });
+    return new Set(rows.map(r => r.id));
+  }
 
   function escapeMd(s = "") {
     return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
   }
+
   function normalizeForGlobal(rec) {
     const base = {
       id: rec.id,
@@ -954,13 +882,210 @@ async function startBot() {
     return base;
   }
 
-  await bot.launch();
-  console.log("Telegram bot started");
+  const badgeTitle = (title, isPublished) => (isPublished ? `${title} · 🌐` : title);
 
+  // --- /start ----------------------------------------------------------
+  bot.start(async (ctx) => {
+    const owner = `tg:${ctx.from.id}`;
+    const [[totalRow]] = [
+      (await pool.query(
+        `select count(*)::int as c from local_recipes where owner=$1`,
+        [owner]
+      )).rows
+    ];
+    const [[pubRow]] = [
+      (await pool.query(
+        `select count(*)::int as c
+           from local_recipes lr
+           join recipes r on r.id = lr.id
+          where lr.owner=$1`,
+        [owner]
+      )).rows
+    ];
+
+    const total = totalRow?.c || 0;
+    const published = pubRow?.c || 0;
+
+    await ctx.reply(
+      `Привет, ${escapeMd(ctx.from.first_name || "друг")}!\n` +
+        `У тебя *${total}* рецепт(ов), из них *${published}* выложено 🌐.\n` +
+        `Нажми, чтобы посмотреть список.`,
+      Markup.inlineKeyboard([[Markup.button.callback("Мои рецепты", "LIST:0")]])
+    );
+  });
+
+  // --- Список рецептов с пометками 🌐 ---------------------------------
+  bot.action(/LIST:(\d+)/, async (ctx) => {
+    try {
+      const page = Number(ctx.match[1] || 0);
+      const owner = `tg:${ctx.from.id}`;
+
+      const { rows } = await pool.query(
+        `select id, data from local_recipes
+          where owner=$1
+          order by updated_at desc`,
+        [owner]
+      );
+
+      const publishedSet = await getPublishedSet(owner);
+      const total = rows.length;
+      const from = page * PAGE_SIZE;
+      const slice = rows.slice(from, from + PAGE_SIZE);
+
+      const buttons = slice.map((r) => [
+        Markup.button.callback(
+          badgeTitle(r.data?.title || r.id, publishedSet.has(r.id)),
+          `OPEN:${r.id}:${page}`
+        ),
+      ]);
+
+      const nav = [];
+      if (page > 0) nav.push(Markup.button.callback("« Назад", `LIST:${page - 1}`));
+      if (from + PAGE_SIZE < total) nav.push(Markup.button.callback("Вперёд »", `LIST:${page + 1}`));
+      if (nav.length) buttons.push(nav);
+
+      const pubCount = publishedSet.size;
+      await ctx.editMessageText(
+        `Мои рецепты (стр. ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))})\n` +
+          `Выложено: ${pubCount} из ${total} 🌐`,
+        Markup.inlineKeyboard(buttons)
+      );
+    } catch (e) {
+      console.error("LIST action error:", e);
+      try { await ctx.answerCbQuery("Ошибка"); } catch {}
+    }
+  });
+
+  // --- Открыть карточку рецепта + статус публикации -------------------
+  bot.action(/OPEN:([^:]+):(\d+)/, async (ctx) => {
+    try {
+      const id = ctx.match[1];
+      const page = Number(ctx.match[2] || 0);
+      const owner = `tg:${ctx.from.id}`;
+
+      const { rows } = await pool.query(
+        `select data from local_recipes where owner=$1 and id=$2`,
+        [owner, id]
+      );
+      if (!rows.length) return ctx.answerCbQuery("Не найдено");
+
+      const r = rows[0].data || {};
+      const isPublished = (await getPublishedSet(owner)).has(id);
+
+      const title = r.title || "Без названия";
+      const ingredients =
+        (Array.isArray(r.parts) && r.parts.length
+          ? r.parts.flatMap((p) => p.ingredients)
+          : r.ingredients) || [];
+      const steps =
+        (Array.isArray(r.parts) && r.parts.length
+          ? r.parts.flatMap((p) => p.steps)
+          : r.steps) || [];
+
+      const text =
+        `*${escapeMd(title)}*\n` +
+        (isPublished ? "🌐 *Выложено в глобал*\n" : "Локально\n") +
+        (r.description ? `\n${escapeMd(r.description)}\n` : "") +
+        (ingredients.length
+          ? `\n*Ингредиенты:*\n• ${escapeMd(ingredients.join("\n• "))}\n`
+          : "") +
+        (steps.length
+          ? `\n*Шаги:*\n${escapeMd(steps.map((s, i) => `${i + 1}. ${s}`).join("\n"))}\n`
+          : "");
+
+      const kbRows = [];
+      if (isPublished) {
+        kbRows.push([Markup.button.callback("🗑 Удалить из глобала", `UNPUB:${id}:${page}`)]);
+      } else {
+        kbRows.push([Markup.button.callback("📤 Выложить в глобал", `PUB:${id}:${page}`)]);
+      }
+      kbRows.push([Markup.button.callback("← К списку", `LIST:${page}`)]);
+      const kb = Markup.inlineKeyboard(kbRows);
+
+      if (r.cover && /^https?:\/\//i.test(r.cover)) {
+        await ctx.replyWithPhoto(r.cover, {
+          caption: text,
+          parse_mode: "Markdown",
+          reply_markup: kb.reply_markup,
+        });
+      } else {
+        await ctx.editMessageText(text, { parse_mode: "Markdown", ...kb });
+      }
+    } catch (e) {
+      console.error("OPEN action error:", e);
+      try { await ctx.answerCbQuery("Ошибка"); } catch {}
+    }
+  });
+
+  // --- Выложить в глобал ----------------------------------------------
+  bot.action(/PUB:([^:]+):(\d+)/, async (ctx) => {
+    try {
+      const id = ctx.match[1];
+      const page = Number(ctx.match[2] || 0);
+      const owner = `tg:${ctx.from.id}`;
+
+      const { rows } = await pool.query(
+        `select data from local_recipes where owner=$1 and id=$2`,
+        [owner, id]
+      );
+      if (!rows.length) return ctx.answerCbQuery("Не найдено");
+
+      await pool.query(
+        `insert into recipes (id, data) values ($1,$2)
+         on conflict (id) do update set data=excluded.data`,
+        [id, normalizeForGlobal(rows[0].data)]
+      );
+
+      invalidateRecipesCache();
+      await ctx.answerCbQuery("Опубликовано ✅");
+      await ctx.editMessageReplyMarkup(
+        Markup.inlineKeyboard([
+          [Markup.button.callback("🗑 Удалить из глобала", `UNPUB:${id}:${page}`)],
+          [Markup.button.callback("← К списку", `LIST:${page}`)],
+        ]).reply_markup
+      );
+    } catch (e) {
+      console.error("PUB action error:", e);
+      try { await ctx.answerCbQuery("Ошибка публикации"); } catch {}
+    }
+  });
+
+  // --- Удалить из глобала ---------------------------------------------
+  bot.action(/UNPUB:([^:]+):(\d+)/, async (ctx) => {
+    try {
+      const id = ctx.match[1];
+      const page = Number(ctx.match[2] || 0);
+      const owner = `tg:${ctx.from.id}`;
+
+      // убедимся, что рецепт принадлежит этому пользователю
+      const { rows } = await pool.query(
+        `select 1 from local_recipes where owner=$1 and id=$2`,
+        [owner, id]
+      );
+      if (!rows.length) return ctx.answerCbQuery("Не найдено");
+
+      await pool.query(`delete from recipes where id=$1`, [id]);
+      invalidateRecipesCache();
+
+      await ctx.answerCbQuery("Удалено из глобала ✅");
+      await ctx.editMessageReplyMarkup(
+        Markup.inlineKeyboard([
+          [Markup.button.callback("📤 Выложить в глобал", `PUB:${id}:${page}`)],
+          [Markup.button.callback("← К списку", `LIST:${page}`)],
+        ]).reply_markup
+      );
+    } catch (e) {
+      console.error("UNPUB action error:", e);
+      try { await ctx.answerCbQuery("Ошибка удаления"); } catch {}
+    }
+  });
+
+  // --- run -------------------------------------------------------------
+  await bot.launch();
+  console.log("Telegram bot started (with id & published checks on every action)");
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 }
-startBot().catch(console.error);
 
 // ---------- START ----------
 app.listen(PORT, () => {
