@@ -350,27 +350,22 @@ app.get("/auth/telegram/callback", async (req, res) => {
 app.post("/auth/telegram/callback", async (req, res) => {
   try {
     if (!TG_BOT_TOKEN) {
-      console.error("No TELEGRAM_BOT_TOKEN in env");
       return res.status(500).json({ error: "bot_token_missing" });
     }
 
     const body = req.body || {};
-    // user может прийти как объект (initData) — превратим в строку для подписи
+
+    // Подготовим payload для подписи:
+    // если пришёл user-объект (initData) — сериализуем, иначе работаем с топ-полями (id, username, ...).
     const toVerify = { ...body };
     if (toVerify.user && typeof toVerify.user !== "string") {
       try { toVerify.user = JSON.stringify(toVerify.user); } catch {}
     }
-
     if (!toVerify.hash || !toVerify.auth_date) {
-      console.error("Callback without hash/auth_date:", Object.keys(body));
-      return res.status(400).json({ error: "bad_payload" });
+      return res.status(400).json({ error: "bad_payload", details: "no hash/auth_date" });
     }
 
     if (!verifyTelegramAuth(toVerify)) {
-      console.warn("invalid_signature:", {
-        gotKeys: Object.keys(toVerify),
-        hashLen: String(toVerify.hash||"").length
-      });
       return res.status(401).json({ error: "invalid_signature" });
     }
 
@@ -392,25 +387,38 @@ app.post("/auth/telegram/callback", async (req, res) => {
     const tg_id = String(user?.id || "");
     if (!tg_id) return res.status(400).json({ error: "no_user" });
 
-    await pool.query(
-      `insert into users (tg_id, username, first_name, last_name, photo_url)
-       values ($1,$2,$3,$4,$5)
-       on conflict (tg_id) do update set
-         username   = excluded.username,
-         first_name = excluded.first_name,
-         last_name  = excluded.last_name,
-         photo_url  = excluded.photo_url,
-         last_login = now()`,
-      [
-        tg_id,
-        normStr(user.username),
-        normStr(user.first_name),
-        normStr(user.last_name),
-        normStr(user.photo_url),
-      ]
-    );
+    // Санитация «странных» символов (иногда first_name может содержать неотображаемые)
+    const s = (x) =>
+      typeof x === "string"
+        ? x.replace(/[\p{C}\uFFFE\uFFFF]/gu, "").trim() || null
+        : null;
 
-    const token = signJwtForTelegram(tg_id);
+    // upsert в users
+    try {
+      await pool.query(
+        `insert into users (tg_id, username, first_name, last_name, photo_url)
+         values ($1,$2,$3,$4,$5)
+         on conflict (tg_id) do update set
+           username   = excluded.username,
+           first_name = excluded.first_name,
+           last_name  = excluded.last_name,
+           photo_url  = excluded.photo_url,
+           last_login = now()`,
+        [tg_id, s(user.username), s(user.first_name), s(user.last_name), s(user.photo_url)]
+      );
+    } catch (e) {
+      console.error("PG upsert users failed:", e);
+      return res.status(500).json({ error: "pg_error", details: String(e?.message || e) });
+    }
+
+    // JWT
+    let token;
+    try {
+      token = signJwtForTelegram(tg_id);
+    } catch (e) {
+      return res.status(500).json({ error: "jwt_error", details: String(e?.message || e) });
+    }
+
     res.cookie("rp_jwt", token, {
       httpOnly: true,
       sameSite: "none",
@@ -425,8 +433,8 @@ app.post("/auth/telegram/callback", async (req, res) => {
       jwt: token,
     });
   } catch (e) {
-    console.error("POST /auth/telegram/callback error:", e);
-    return res.status(500).json({ error: "internal" });
+    console.error("POST /auth/telegram/callback fatal:", e);
+    return res.status(500).json({ error: "internal", details: String(e?.message || e) });
   }
 });
 
