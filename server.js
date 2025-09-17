@@ -349,31 +349,37 @@ app.get("/auth/telegram/callback", async (req, res) => {
 // ----- 3) Callback ДЛЯ FETCH(JSON) (POST) -----
 app.post("/auth/telegram/callback", async (req, res) => {
   try {
-    const body = req.body || {};
+    if (!TG_BOT_TOKEN) {
+      console.error("No TELEGRAM_BOT_TOKEN in env");
+      return res.status(500).json({ error: "bot_token_missing" });
+    }
 
-    // Если прислали user-объект (из initData) — приведём его к строке для подписи
+    const body = req.body || {};
+    // user может прийти как объект (initData) — превратим в строку для подписи
     const toVerify = { ...body };
     if (toVerify.user && typeof toVerify.user !== "string") {
-      try {
-        toVerify.user = JSON.stringify(toVerify.user);
-      } catch {}
+      try { toVerify.user = JSON.stringify(toVerify.user); } catch {}
+    }
+
+    if (!toVerify.hash || !toVerify.auth_date) {
+      console.error("Callback without hash/auth_date:", Object.keys(body));
+      return res.status(400).json({ error: "bad_payload" });
     }
 
     if (!verifyTelegramAuth(toVerify)) {
+      console.warn("invalid_signature:", {
+        gotKeys: Object.keys(toVerify),
+        hashLen: String(toVerify.hash||"").length
+      });
       return res.status(401).json({ error: "invalid_signature" });
     }
 
-    // Соберём профиль
+    // Собираем профиль
     let user = body.user;
     if (typeof user === "string") {
-      try {
-        user = JSON.parse(user);
-      } catch {
-        user = null;
-      }
+      try { user = JSON.parse(user); } catch { user = null; }
     }
     if (!user) {
-      // формат "топ-поля" (виджет без user)
       user = {
         id: Number(body.id),
         first_name: body.first_name,
