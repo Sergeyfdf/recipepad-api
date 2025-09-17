@@ -120,14 +120,6 @@ function getOwner(req) {
   return String(req.header("X-Owner-Id") || req.query.owner || "").trim();
 }
 
-function signJwtForTelegram(tgId) {
-  const jwtSecret = process.env.JWT_SECRET || "dev-secret";
-  // payload совместим с твоим requireAuth
-  return jwt.sign({ sub: `tg:${tgId}`, tg_id: String(tgId) }, jwtSecret, {
-    expiresIn: "90d",
-  });
-}
-
 function requireAuth(req, res, next) {
   try {
     const h = String(req.headers.authorization || "");
