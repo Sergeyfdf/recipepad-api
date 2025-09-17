@@ -803,22 +803,28 @@ async function startBot() {
   }
 
   const bot = new Telegraf(BOT);
+
+  // лог ошибок telegraf-хэндлеров
+  bot.catch((err, ctx) => {
+    console.error("Telegraf error on", ctx?.updateType, err);
+  });
+
+  // доступ: разрешаем только если в users.bot_enabled != false
   bot.use(async (ctx, next) => {
     try {
-      if (!ctx.from) return; // сервисные апдейты пропускаем
+      if (!ctx.from) return; // пропускаем сервисные апдейты
       const tgId = String(ctx.from.id);
       const { rows } = await pool.query(
-        `select bot_enabled from users where tg_id = $1`,
+        `select bot_enabled from users where tg_id=$1`,
         [tgId]
       );
       const allowed = rows.length ? rows[0].bot_enabled !== false : true; // по умолчанию true
-  
       if (!allowed) {
         await ctx.reply(
-          "Ваш Telegram отвязан от веб-аккаунта. " +
+          "Ваш Telegram отвязан от веб-аккаунта.\n" +
           "Зайдите на сайт и включите «Доступ бота», чтобы снова открыть рецепты."
         );
-        return; // блокируем доступ дальше
+        return; // не пускаем дальше
       }
     } catch (e) {
       console.error("bot access check failed:", e);
@@ -827,11 +833,14 @@ async function startBot() {
     }
     return next();
   });
+
+  // быстрая диагностика
+  bot.command("ping", (ctx) => ctx.reply("pong ✅"));
+
   const PAGE_SIZE = 5;
 
-  // --- helpers ---------------------------------------------------------
+  // ===== helpers =====
   async function getPublishedSet(owner) {
-    // какие локальные рецепты этого owner выложены в глобал
     const { rows } = await pool.query(
       `select lr.id
          from local_recipes lr
@@ -867,39 +876,42 @@ async function startBot() {
     return base;
   }
 
-  const badgeTitle = (title, isPublished) => (isPublished ? `${title} · 🌐` : title);
+  const badgeTitle = (title, isPublished) =>
+    (isPublished ? `${title} · 🌐` : title);
 
-  // --- /start ----------------------------------------------------------
+  // ===== /start =====
   bot.start(async (ctx) => {
-    const owner = `tg:${ctx.from.id}`;
-    const [[totalRow]] = [
-      (await pool.query(
+    try {
+      const owner = `tg:${ctx.from.id}`;
+      const totalRow = (await pool.query(
         `select count(*)::int as c from local_recipes where owner=$1`,
         [owner]
-      )).rows
-    ];
-    const [[pubRow]] = [
-      (await pool.query(
+      )).rows[0] || { c: 0 };
+
+      const pubRow = (await pool.query(
         `select count(*)::int as c
            from local_recipes lr
            join recipes r on r.id = lr.id
           where lr.owner=$1`,
         [owner]
-      )).rows
-    ];
+      )).rows[0] || { c: 0 };
 
-    const total = totalRow?.c || 0;
-    const published = pubRow?.c || 0;
+      const total = totalRow.c || 0;
+      const published = pubRow.c || 0;
 
-    await ctx.reply(
-      `Привет, ${escapeMd(ctx.from.first_name || "друг")}!\n` +
+      await ctx.reply(
+        `Привет, ${escapeMd(ctx.from.first_name || "друг")}!\n` +
         `У тебя *${total}* рецепт(ов), из них *${published}* выложено 🌐.\n` +
         `Нажми, чтобы посмотреть список.`,
-      Markup.inlineKeyboard([[Markup.button.callback("Мои рецепты", "LIST:0")]])
-    );
+        Markup.inlineKeyboard([[Markup.button.callback("Мои рецепты", "LIST:0")]])
+      );
+    } catch (e) {
+      console.error("/start failed:", e);
+      await ctx.reply("Что-то пошло не так. Попробуйте ещё раз позже.");
+    }
   });
 
-  // --- Список рецептов с пометками 🌐 ---------------------------------
+  // ===== список =====
   bot.action(/LIST:(\d+)/, async (ctx) => {
     try {
       const page = Number(ctx.match[1] || 0);
@@ -932,7 +944,7 @@ async function startBot() {
       const pubCount = publishedSet.size;
       await ctx.editMessageText(
         `Мои рецепты (стр. ${page + 1}/${Math.max(1, Math.ceil(total / PAGE_SIZE))})\n` +
-          `Выложено: ${pubCount} из ${total} 🌐`,
+        `Выложено: ${pubCount} из ${total} 🌐`,
         Markup.inlineKeyboard(buttons)
       );
     } catch (e) {
@@ -941,7 +953,7 @@ async function startBot() {
     }
   });
 
-  // --- Открыть карточку рецепта + статус публикации -------------------
+  // ===== открыть карточку =====
   bot.action(/OPEN:([^:]+):(\d+)/, async (ctx) => {
     try {
       const id = ctx.match[1];
@@ -1002,7 +1014,7 @@ async function startBot() {
     }
   });
 
-  // --- Выложить в глобал ----------------------------------------------
+  // ===== выложить в глобал =====
   bot.action(/PUB:([^:]+):(\d+)/, async (ctx) => {
     try {
       const id = ctx.match[1];
@@ -1021,7 +1033,11 @@ async function startBot() {
         [id, normalizeForGlobal(rows[0].data)]
       );
 
-      invalidateRecipesCache();
+      // сброс кэша, если у тебя он есть выше; иначе просто убери эту строку
+      if (typeof invalidateRecipesCache === "function") {
+        invalidateRecipesCache();
+      }
+
       await ctx.answerCbQuery("Опубликовано ✅");
       await ctx.editMessageReplyMarkup(
         Markup.inlineKeyboard([
@@ -1035,7 +1051,7 @@ async function startBot() {
     }
   });
 
-  // --- Удалить из глобала ---------------------------------------------
+  // ===== удалить из глобала =====
   bot.action(/UNPUB:([^:]+):(\d+)/, async (ctx) => {
     try {
       const id = ctx.match[1];
@@ -1050,7 +1066,10 @@ async function startBot() {
       if (!rows.length) return ctx.answerCbQuery("Не найдено");
 
       await pool.query(`delete from recipes where id=$1`, [id]);
-      invalidateRecipesCache();
+
+      if (typeof invalidateRecipesCache === "function") {
+        invalidateRecipesCache();
+      }
 
       await ctx.answerCbQuery("Удалено из глобала ✅");
       await ctx.editMessageReplyMarkup(
@@ -1065,12 +1084,26 @@ async function startBot() {
     }
   });
 
-  // --- run -------------------------------------------------------------
-  await bot.launch();
-  console.log("Telegram bot started (with id & published checks on every action)");
+  // ===== ВАЖНО: снести webhook и запустить polling =====
+  try {
+    const info = await bot.telegram.getWebhookInfo();
+    if (info?.url) {
+      console.log("Webhook was set to:", info.url, "— deleting…");
+    }
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+  } catch (e) {
+    console.warn("deleteWebhook failed (можно игнорировать):", e?.message || e);
+  }
+
+  await bot.launch({
+    polling: { allowedUpdates: ["message", "callback_query"] },
+  });
+  console.log("Telegram bot started (polling).");
+
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 }
+
 
 // ---------- START ----------
 app.listen(PORT, () => {
