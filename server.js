@@ -82,6 +82,7 @@ async function ensureUsersSchema() {
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS photo_url  text;`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_login timestamptz NOT NULL DEFAULT now();`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS bot_enabled boolean NOT NULL DEFAULT true;`);
   await pool.query(`
     DO $$
     BEGIN
@@ -116,6 +117,18 @@ async function ensureUsersSchema() {
       END IF;
     END$$;
   `);
+  await pool.query(
+    `INSERT INTO users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
+     VALUES ($1,$2,$3,$4,$5, true)
+     ON CONFLICT ON CONSTRAINT users_tg_id_key
+     DO UPDATE SET
+       username   = EXCLUDED.username,
+       first_name = EXCLUDED.first_name,
+       last_name  = EXCLUDED.last_name,
+       photo_url  = EXCLUDED.photo_url,
+       last_login = now()`
+    , [tg_id, clean(user.username), clean(user.first_name), clean(user.last_name), clean(user.photo_url)]
+  );
 }
 
 // вызов в инициализации:
@@ -505,6 +518,27 @@ app.post("/auth/telegram/callback", async (req, res) => {
 });
 
 
+app.post("/auth/telegram/link", requireAuth, async (req, res) => {
+  try {
+    await pool.query(`update users set bot_enabled=true where tg_id=$1`, [String(req.user.tg_id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("link bot failed", e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+app.post("/auth/telegram/unlink", requireAuth, async (req, res) => {
+  try {
+    await pool.query(`update users set bot_enabled=false where tg_id=$1`, [String(req.user.tg_id)]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("unlink bot failed", e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+
 // ----- 4) СЕССИЯ -----
 app.get("/auth/session/me", requireAuth, async (req, res) => {
   try {
@@ -782,28 +816,6 @@ app.get("/debug/tg", async (_req, res) => {
 });
 
 
-
-app.post("/auth/telegram/link", requireAuth, async (req, res) => {
-  try {
-    await pool.query(`update users set bot_enabled=true where tg_id=$1`, [String(req.user.tg_id)]);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("link bot failed", e);
-    res.status(500).json({ error: "internal" });
-  }
-});
-
-// отключить доступ бота
-app.post("/auth/telegram/unlink", requireAuth, async (req, res) => {
-  try {
-    await pool.query(`update users set bot_enabled=false where tg_id=$1`, [String(req.user.tg_id)]);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("unlink bot failed", e);
-    res.status(500).json({ error: "internal" });
-  }
-});
-
 // =====================================================================
 // =========================== TELEGRAM BOT =============================
 // =====================================================================
@@ -817,26 +829,23 @@ async function startBot() {
   const bot = new Telegraf(BOT);
   bot.use(async (ctx, next) => {
     try {
-      if (!ctx.from) return; // например, канал/сервисное
+      if (!ctx.from) return; // сервисные апдейты пропускаем
       const tgId = String(ctx.from.id);
       const { rows } = await pool.query(
         `select bot_enabled from users where tg_id = $1`,
         [tgId]
       );
-      // По умолчанию считаем, что доступ есть (true), если записи нет.
-      // Если хочешь строго — поставь const allowed = !!rows[0]?.bot_enabled;
-      const allowed = rows.length ? rows[0].bot_enabled !== false : true;
+      const allowed = rows.length ? rows[0].bot_enabled !== false : true; // по умолчанию true
   
       if (!allowed) {
         await ctx.reply(
           "Ваш Telegram отвязан от веб-аккаунта. " +
-          "Чтобы снова включить доступ, зайдите на сайт и включите «Доступ бота»."
+          "Зайдите на сайт и включите «Доступ бота», чтобы снова открыть рецепты."
         );
-        return;
+        return; // блокируем доступ дальше
       }
     } catch (e) {
       console.error("bot access check failed:", e);
-      // В случае ошибки лучше не отдавать данные.
       try { await ctx.reply("Временная ошибка доступа."); } catch {}
       return;
     }
