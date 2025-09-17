@@ -1110,6 +1110,9 @@ app.listen(PORT, () => {
   console.log(`API on :${PORT}`);
 });
 
+startBot().catch((e) => console.error("startBot failed:", e));
+
+
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   try {
