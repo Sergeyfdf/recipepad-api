@@ -61,6 +61,28 @@ function signJwtForTelegram(tg_id) {
   const jwtSecret = process.env.JWT_SECRET || "dev-secret";
   return jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, { expiresIn: "90d" });
 }
+
+async function upsertUserRow({ tg_id, username, first_name, last_name, photo_url }) {
+  const clean = (x) =>
+    typeof x === "string"
+      ? x.replace(/[\p{C}\uFFFE\uFFFF]/gu, "").trim() || null
+      : null;
+
+  await pool.query(
+    `INSERT INTO public.users (tg_id, username, first_name, last_name, photo_url)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT ON CONSTRAINT users_tg_id_key
+     DO UPDATE SET
+       username   = EXCLUDED.username,
+       first_name = EXCLUDED.first_name,
+       last_name  = EXCLUDED.last_name,
+       photo_url  = EXCLUDED.photo_url,
+       last_login = now()`,
+    [tg_id, clean(username), clean(first_name), clean(last_name), clean(photo_url)]
+  );
+}
+
+
 // ========================= SCHEMA =========================
 async function ensureUsersSchema() {
   await pool.query(`
@@ -117,18 +139,6 @@ async function ensureUsersSchema() {
       END IF;
     END$$;
   `);
-  await pool.query(
-    `INSERT INTO users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
-     VALUES ($1,$2,$3,$4,$5, true)
-     ON CONFLICT ON CONSTRAINT users_tg_id_key
-     DO UPDATE SET
-       username   = EXCLUDED.username,
-       first_name = EXCLUDED.first_name,
-       last_name  = EXCLUDED.last_name,
-       photo_url  = EXCLUDED.photo_url,
-       last_login = now()`
-    , [tg_id, clean(user.username), clean(user.first_name), clean(user.last_name), clean(user.photo_url)]
-  );
 }
 
 // вызов в инициализации:
@@ -320,17 +330,7 @@ app.post("/auth/telegram", async (req, res) => {
     const last_name = normStr(data.last_name);
     const photo_url = normStr(data.photo_url);
 
-    await pool.query(
-      `insert into users (tg_id, username, first_name, last_name, photo_url)
-       values ($1,$2,$3,$4,$5)
-       on conflict (tg_id) do update set
-         username   = excluded.username,
-         first_name = excluded.first_name,
-         last_name  = excluded.last_name,
-         photo_url  = excluded.photo_url,
-         last_login = now()`,
-      [tg_id, username, first_name, last_name, photo_url]
-    );
+    await upsertUserRow({ tg_id, username, first_name, last_name, photo_url });
 
     const token = signJwtForTelegram(tg_id);
 
@@ -390,23 +390,13 @@ app.get("/auth/telegram/callback", async (req, res) => {
     if (!tg_id) return res.status(400).send("no_user");
 
     // upsert user
-    await pool.query(
-      `insert into users (tg_id, username, first_name, last_name, photo_url)
-       values ($1,$2,$3,$4,$5)
-       on conflict (tg_id) do update set
-         username   = excluded.username,
-         first_name = excluded.first_name,
-         last_name  = excluded.last_name,
-         photo_url  = excluded.photo_url,
-         last_login = now()`,
-      [
-        tg_id,
-        normStr(user.username),
-        normStr(user.first_name),
-        normStr(user.last_name),
-        normStr(user.photo_url),
-      ]
-    );
+    await upsertUserRow({
+      tg_id,
+      username: user.username,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      photo_url: user.photo_url,
+    });
 
     const token = signJwtForTelegram(tg_id);
     res.cookie("rp_jwt", token, {
@@ -434,7 +424,7 @@ app.post("/auth/telegram/callback", async (req, res) => {
 
     const body = req.body || {};
 
-    // payload для проверки подписи
+    // Готовим payload для проверки подписи (user должен быть строкой)
     const toVerify = { ...body };
     if (toVerify.user && typeof toVerify.user !== "string") {
       try { toVerify.user = JSON.stringify(toVerify.user); } catch {}
@@ -442,12 +432,11 @@ app.post("/auth/telegram/callback", async (req, res) => {
     if (!toVerify.hash || !toVerify.auth_date) {
       return res.status(400).json({ error: "bad_payload", details: "no hash/auth_date" });
     }
-
     if (!verifyTelegramAuth(toVerify)) {
       return res.status(401).json({ error: "invalid_signature" });
     }
 
-    // собираем профиль
+    // Собираем профиль
     let user = body.user;
     if (typeof user === "string") {
       try { user = JSON.parse(user); } catch { user = null; }
@@ -465,39 +454,19 @@ app.post("/auth/telegram/callback", async (req, res) => {
     const tg_id = String(user?.id || "");
     if (!tg_id) return res.status(400).json({ error: "no_user" });
 
-    const clean = (x) =>
-      typeof x === "string"
-        ? x.replace(/[\p{C}\uFFFE\uFFFF]/gu, "").trim() || null
-        : null;
-
-    // upsert в users — теперь колонка tg_id точно есть
-    try {
-      await pool.query(
-        `INSERT INTO public.users (tg_id, username, first_name, last_name, photo_url)
-         VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT ON CONSTRAINT users_tg_id_key
-         DO UPDATE SET
-           username   = EXCLUDED.username,
-           first_name = EXCLUDED.first_name,
-           last_name  = EXCLUDED.last_name,
-           photo_url  = EXCLUDED.photo_url,
-           last_login = now()`,
-        [tg_id, clean(user.username), clean(user.first_name), clean(user.last_name), clean(user.photo_url)]
-      );
-    } catch (e) {
-      console.error("PG upsert users failed:", e);
-      return res.status(500).json({ error: "pg_error", details: String(e?.message || e) });
-    }
+    // Единственный UPSERT пользователя
+    await upsertUserRow({
+      tg_id,
+      username: user.username,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      photo_url: user.photo_url,
+    });
 
     // JWT
-    let token;
-    try {
-      token = signJwtForTelegram(tg_id);
-    } catch (e) {
-      return res.status(500).json({ error: "jwt_error", details: String(e?.message || e) });
-    }
+    const token = signJwtForTelegram(tg_id);
 
-    // httpOnly cookie (дополнительно к JSON)
+    // httpOnly cookie (если будешь использовать куки)
     res.cookie("rp_jwt", token, {
       httpOnly: true,
       sameSite: "none",
@@ -505,18 +474,25 @@ app.post("/auth/telegram/callback", async (req, res) => {
       maxAge: 90 * 24 * 3600 * 1000,
     });
 
+    // Отдаём и user, и profile (алиас), и token для совместимости
     return res.json({
       ok: true,
       ownerId: `tg:${tg_id}`,
       user,
+      profile: {
+        username: user.username ?? null,
+        first_name: user.first_name ?? null,
+        last_name: user.last_name ?? null,
+        photo_url: user.photo_url ?? null,
+      },
       jwt: token,
+      token, // алиас на всякий случай
     });
   } catch (e) {
     console.error("POST /auth/telegram/callback fatal:", e);
     return res.status(500).json({ error: "internal", details: String(e?.message || e) });
   }
 });
-
 
 app.post("/auth/telegram/link", requireAuth, async (req, res) => {
   try {
