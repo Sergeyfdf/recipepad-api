@@ -55,61 +55,57 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }, // для Neon/Render
 });
 
+
+
+function signJwtForTelegram(tg_id) {
+  const jwtSecret = process.env.JWT_SECRET || "dev-secret";
+  return jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, { expiresIn: "90d" });
+}
 // ========================= SCHEMA =========================
-async function ensureSchema() {
+async function ensureUsersSchema() {
+  // создаём таблицу, если её нет (НО это не меняет существующую)
   await pool.query(`
-    -- Глобальные (опубликованные) рецепты
-    create table if not exists recipes (
-      id         text primary key,
-      data       jsonb not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
-
-    -- Личные рецепты (по владельцу owner = telegram id)
-    create table if not exists local_recipes (
-      owner      text not null,
-      id         text not null,
-      data       jsonb not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      primary key (owner, id)
-    );
-
-    -- Пользователи Telegram
-    create table if not exists users (
-      tg_id      text primary key,
+    CREATE TABLE IF NOT EXISTS users (
+      tg_id      text PRIMARY KEY,
       username   text,
       first_name text,
       last_name  text,
       photo_url  text,
-      created_at timestamptz not null default now(),
-      last_login timestamptz not null default now()
+      created_at timestamptz NOT NULL DEFAULT now(),
+      last_login timestamptz NOT NULL DEFAULT now()
     );
+  `);
 
-    -- updated_at триггер
-    create or replace function touch_updated_at() returns trigger as $$
-    begin
-      new.updated_at = now();
-      return new;
-    end $$ language plpgsql;
+  // добиваем недостающие колонки в уже существующей таблице
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_id      text;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username   text;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name text;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  text;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url  text;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login timestamptz NOT NULL DEFAULT now();`);
 
-    drop trigger if exists tr_touch_updated_at_recipes on recipes;
-    create trigger tr_touch_updated_at_recipes
-      before update on recipes
-      for each row execute procedure touch_updated_at();
-
-    drop trigger if exists tr_touch_updated_at_local_recipes on local_recipes;
-    create trigger tr_touch_updated_at_local_recipes
-      before update on local_recipes
-      for each row execute procedure touch_updated_at();
-
-    create index if not exists idx_recipes_updated_at on recipes (updated_at desc);
-    create index if not exists idx_local_recipes_updated_at on local_recipes (updated_at desc);
+  // проставим PK, если его нет
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM   information_schema.table_constraints
+        WHERE  table_schema = 'public'
+        AND    table_name   = 'users'
+        AND    constraint_type = 'PRIMARY KEY'
+      ) THEN
+        -- если pk нет, добавляем на tg_id
+        EXECUTE 'ALTER TABLE public.users ADD CONSTRAINT users_pkey PRIMARY KEY (tg_id)';
+      END IF;
+    END$$;
   `);
 }
-ensureSchema().catch((err) => {
-  console.error("ensureSchema error:", err);
+
+// вызови это сразу после создания pool, до старта сервера и до работы с /auth
+ensureUsersSchema().catch(err => {
+  console.error("ensureUsersSchema error:", err);
 });
 
 // ========================= UTILS =========================
@@ -355,8 +351,7 @@ app.post("/auth/telegram/callback", async (req, res) => {
 
     const body = req.body || {};
 
-    // Подготовим payload для подписи:
-    // если пришёл user-объект (initData) — сериализуем, иначе работаем с топ-полями (id, username, ...).
+    // payload для проверки подписи
     const toVerify = { ...body };
     if (toVerify.user && typeof toVerify.user !== "string") {
       try { toVerify.user = JSON.stringify(toVerify.user); } catch {}
@@ -369,7 +364,7 @@ app.post("/auth/telegram/callback", async (req, res) => {
       return res.status(401).json({ error: "invalid_signature" });
     }
 
-    // Собираем профиль
+    // собираем профиль
     let user = body.user;
     if (typeof user === "string") {
       try { user = JSON.parse(user); } catch { user = null; }
@@ -387,24 +382,23 @@ app.post("/auth/telegram/callback", async (req, res) => {
     const tg_id = String(user?.id || "");
     if (!tg_id) return res.status(400).json({ error: "no_user" });
 
-    // Санитация «странных» символов (иногда first_name может содержать неотображаемые)
-    const s = (x) =>
+    const clean = (x) =>
       typeof x === "string"
         ? x.replace(/[\p{C}\uFFFE\uFFFF]/gu, "").trim() || null
         : null;
 
-    // upsert в users
+    // upsert в users — теперь колонка tg_id точно есть
     try {
       await pool.query(
-        `insert into users (tg_id, username, first_name, last_name, photo_url)
-         values ($1,$2,$3,$4,$5)
-         on conflict (tg_id) do update set
-           username   = excluded.username,
-           first_name = excluded.first_name,
-           last_name  = excluded.last_name,
-           photo_url  = excluded.photo_url,
+        `INSERT INTO users (tg_id, username, first_name, last_name, photo_url)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (tg_id) DO UPDATE SET
+           username   = EXCLUDED.username,
+           first_name = EXCLUDED.first_name,
+           last_name  = EXCLUDED.last_name,
+           photo_url  = EXCLUDED.photo_url,
            last_login = now()`,
-        [tg_id, s(user.username), s(user.first_name), s(user.last_name), s(user.photo_url)]
+        [tg_id, clean(user.username), clean(user.first_name), clean(user.last_name), clean(user.photo_url)]
       );
     } catch (e) {
       console.error("PG upsert users failed:", e);
@@ -419,6 +413,7 @@ app.post("/auth/telegram/callback", async (req, res) => {
       return res.status(500).json({ error: "jwt_error", details: String(e?.message || e) });
     }
 
+    // httpOnly cookie (дополнительно к JSON)
     res.cookie("rp_jwt", token, {
       httpOnly: true,
       sameSite: "none",
@@ -437,6 +432,7 @@ app.post("/auth/telegram/callback", async (req, res) => {
     return res.status(500).json({ error: "internal", details: String(e?.message || e) });
   }
 });
+
 
 // ----- 4) СЕССИЯ -----
 app.get("/auth/session/me", requireAuth, async (req, res) => {
