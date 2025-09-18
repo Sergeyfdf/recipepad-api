@@ -62,6 +62,30 @@ function signJwtForTelegram(tg_id) {
   return jwt.sign({ sub: `tg:${tg_id}`, tg_id }, jwtSecret, { expiresIn: "90d" });
 }
 
+
+function requireAuthFlex(req, res, next) {
+  try {
+    const jwtSecret = process.env.JWT_SECRET || "dev-secret";
+
+    // 1) Authorization: Bearer ...
+    const ah = String(req.headers.authorization || "");
+    let token = null;
+    const m = ah.match(/^Bearer\s+(.+)$/i);
+    if (m) token = m[1];
+
+    // 2) fallback: httpOnly cookie
+    if (!token && req.cookies?.rp_jwt) token = req.cookies.rp_jwt;
+
+    if (!token) return res.status(401).json({ error: "no_token" });
+
+    const payload = jwt.verify(token, jwtSecret);
+    req.user = payload; // { sub: 'tg:<id>', tg_id: '<id>' }
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "bad_token" });
+  }
+}
+
 async function upsertUserRow({ tg_id, username, first_name, last_name, photo_url }) {
   const clean = (x) =>
     typeof x === "string"
@@ -330,7 +354,18 @@ app.post("/auth/telegram", async (req, res) => {
     const last_name = normStr(data.last_name);
     const photo_url = normStr(data.photo_url);
 
-    await upsertUserRow({ tg_id, username, first_name, last_name, photo_url });
+    await pool.query(
+      `insert into users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
+       values ($1,$2,$3,$4,$5, true)
+       on conflict (tg_id) do update set
+         username   = excluded.username,
+         first_name = excluded.first_name,
+         last_name  = excluded.last_name,
+         photo_url  = excluded.photo_url,
+         last_login = now(),
+         bot_enabled = true`,
+      [tg_id, username, first_name, last_name, photo_url]
+    );
 
     const token = signJwtForTelegram(tg_id);
 
@@ -390,13 +425,18 @@ app.get("/auth/telegram/callback", async (req, res) => {
     if (!tg_id) return res.status(400).send("no_user");
 
     // upsert user
-    await upsertUserRow({
-      tg_id,
-      username: user.username,
-      first_name: user.first_name,
-      last_name: user.last_name,
-      photo_url: user.photo_url,
-    });
+    await pool.query(
+      `insert into users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
+       values ($1,$2,$3,$4,$5, true)
+       on conflict (tg_id) do update set
+         username   = excluded.username,
+         first_name = excluded.first_name,
+         last_name  = excluded.last_name,
+         photo_url  = excluded.photo_url,
+         last_login = now(),
+         bot_enabled = true`,
+      [tg_id, username, first_name, last_name, photo_url]
+    );
 
     const token = signJwtForTelegram(tg_id);
     res.cookie("rp_jwt", token, {
@@ -455,13 +495,18 @@ app.post("/auth/telegram/callback", async (req, res) => {
     if (!tg_id) return res.status(400).json({ error: "no_user" });
 
     // Единственный UPSERT пользователя
-    await upsertUserRow({
-      tg_id,
-      username: user.username,
-      first_name: user.first_name,
-      last_name: user.last_name,
-      photo_url: user.photo_url,
-    });
+    await pool.query(
+      `insert into users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
+       values ($1,$2,$3,$4,$5, true)
+       on conflict (tg_id) do update set
+         username   = excluded.username,
+         first_name = excluded.first_name,
+         last_name  = excluded.last_name,
+         photo_url  = excluded.photo_url,
+         last_login = now(),
+         bot_enabled = true`,
+      [tg_id, username, first_name, last_name, photo_url]
+    );
 
     // JWT
     const token = signJwtForTelegram(tg_id);
@@ -511,6 +556,22 @@ app.post("/auth/telegram/unlink", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("unlink bot failed", e);
     res.status(500).json({ error: "internal" });
+  }
+});
+
+
+
+
+app.post("/auth/logout", requireAuthFlex, async (req, res) => {
+  try {
+    const tgId = String(req.user.tg_id);
+    await pool.query(`update users set bot_enabled=false where tg_id=$1`, [tgId]);
+    // чистим httpOnly cookie (если используешь)
+    res.clearCookie("rp_jwt", { sameSite: "none", secure: true });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("logout failed:", e);
+    return res.status(500).json({ error: "internal" });
   }
 });
 
