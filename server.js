@@ -86,23 +86,34 @@ function requireAuthFlex(req, res, next) {
   }
 }
 
-async function upsertUserRow({ tg_id, username, first_name, last_name, photo_url }) {
-  const clean = (x) =>
-    typeof x === "string"
-      ? x.replace(/[\p{C}\uFFFE\uFFFF]/gu, "").trim() || null
-      : null;
 
+function cleanField(x) {
+  return (typeof x === "string"
+    ? x.replace(/[\p{C}\uFFFE\uFFFF]/gu, "").trim()
+    : ""
+  ) || null;
+}
+
+async function upsertUserRow({ tg_id, username, first_name, last_name, photo_url, bot_enabled = true }) {
   await pool.query(
-    `INSERT INTO public.users (tg_id, username, first_name, last_name, photo_url)
-     VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT ON CONSTRAINT users_tg_id_key
+    `INSERT INTO public.users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (tg_id)
      DO UPDATE SET
        username   = EXCLUDED.username,
        first_name = EXCLUDED.first_name,
        last_name  = EXCLUDED.last_name,
        photo_url  = EXCLUDED.photo_url,
-       last_login = now()`,
-    [tg_id, clean(username), clean(first_name), clean(last_name), clean(photo_url)]
+       last_login = now(),
+       bot_enabled = EXCLUDED.bot_enabled`,
+    [
+      String(tg_id),
+      cleanField(username),
+      cleanField(first_name),
+      cleanField(last_name),
+      cleanField(photo_url),
+      bot_enabled === false ? false : true, // по умолчанию включаем
+    ]
   );
 }
 
@@ -464,7 +475,7 @@ app.post("/auth/telegram/callback", async (req, res) => {
 
     const body = req.body || {};
 
-    // Готовим payload для проверки подписи (user должен быть строкой)
+    // payload для проверки подписи — важно, чтобы user был строкой (как прислал Telegram)
     const toVerify = { ...body };
     if (toVerify.user && typeof toVerify.user !== "string") {
       try { toVerify.user = JSON.stringify(toVerify.user); } catch {}
@@ -472,11 +483,12 @@ app.post("/auth/telegram/callback", async (req, res) => {
     if (!toVerify.hash || !toVerify.auth_date) {
       return res.status(400).json({ error: "bad_payload", details: "no hash/auth_date" });
     }
+
     if (!verifyTelegramAuth(toVerify)) {
       return res.status(401).json({ error: "invalid_signature" });
     }
 
-    // Собираем профиль
+    // Парсим профиль
     let user = body.user;
     if (typeof user === "string") {
       try { user = JSON.parse(user); } catch { user = null; }
@@ -494,24 +506,20 @@ app.post("/auth/telegram/callback", async (req, res) => {
     const tg_id = String(user?.id || "");
     if (!tg_id) return res.status(400).json({ error: "no_user" });
 
-    // Единственный UPSERT пользователя
-    await pool.query(
-      `insert into users (tg_id, username, first_name, last_name, photo_url, bot_enabled)
-       values ($1,$2,$3,$4,$5, true)
-       on conflict (tg_id) do update set
-         username   = excluded.username,
-         first_name = excluded.first_name,
-         last_name  = excluded.last_name,
-         photo_url  = excluded.photo_url,
-         last_login = now(),
-         bot_enabled = true`,
-      [tg_id, username, first_name, last_name, photo_url]
-    );
+    // ЕДИНСТВЕННЫЙ upsert (без дублирования)
+    await upsertUserRow({
+      tg_id,
+      username: user.username,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      photo_url: user.photo_url,
+      bot_enabled: true, // включаем доступ бота при входе
+    });
 
     // JWT
     const token = signJwtForTelegram(tg_id);
 
-    // httpOnly cookie (если будешь использовать куки)
+    // httpOnly cookie
     res.cookie("rp_jwt", token, {
       httpOnly: true,
       sameSite: "none",
@@ -519,19 +527,11 @@ app.post("/auth/telegram/callback", async (req, res) => {
       maxAge: 90 * 24 * 3600 * 1000,
     });
 
-    // Отдаём и user, и profile (алиас), и token для совместимости
     return res.json({
       ok: true,
       ownerId: `tg:${tg_id}`,
       user,
-      profile: {
-        username: user.username ?? null,
-        first_name: user.first_name ?? null,
-        last_name: user.last_name ?? null,
-        photo_url: user.photo_url ?? null,
-      },
       jwt: token,
-      token, // алиас на всякий случай
     });
   } catch (e) {
     console.error("POST /auth/telegram/callback fatal:", e);
