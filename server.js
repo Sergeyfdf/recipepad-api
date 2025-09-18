@@ -252,23 +252,52 @@ function normStr(x) {
 }
 
 function getOwner(req) {
-  // фронт шлёт X-Owner-Id, оставляем как источник истины
-  return String(req.header("X-Owner-Id") || req.query.owner || "").trim();
+  // 1) явный заголовок из фронта
+  const headerOwner = String(req.header("X-Owner-Id") || req.query.owner || "").trim();
+  if (headerOwner) return headerOwner;
+  // 2) если есть аутентификация — owner = tg:<id> из токена
+  if (req.user?.tg_id) return `tg:${req.user.tg_id}`;
+  return "";
 }
 
+function getTokenFromReq(req) {
+  const h = String(req.headers?.authorization || "");
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (m) return m[1];
+  if (req.cookies?.rp_jwt) return String(req.cookies.rp_jwt);
+  return null;
+}
+
+function decodeJwt(token) {
+  const jwtSecret = process.env.JWT_SECRET || "dev-secret";
+  return jwt.verify(token, jwtSecret);
+}
+
+// строгий гард как был, но читает и cookie
 function requireAuth(req, res, next) {
   try {
-    const h = String(req.headers.authorization || "");
-    const m = h.match(/^Bearer\s+(.+)$/i);
-    if (!m) return res.status(401).json({ error: "no_token" });
-    const token = m[1];
-    const jwtSecret = process.env.JWT_SECRET || "dev-secret";
-    const payload = jwt.verify(token, jwtSecret);
+    const token = getTokenFromReq(req);
+    if (!token) return res.status(401).json({ error: "no_token" });
+    const payload = decodeJwt(token);
     req.user = payload; // { sub: "tg:<id>", tg_id: "<id>" }
     next();
   } catch (e) {
     return res.status(401).json({ error: "bad_token" });
   }
+}
+
+// НЕобязательная авторизация: если токен есть — распарсим, если нет — просто идём дальше
+function optionalAuth(req, _res, next) {
+  try {
+    const token = getTokenFromReq(req);
+    if (token) {
+      const payload = decodeJwt(token);
+      req.user = payload;
+    }
+  } catch (e) {
+    // молча игнорируем, это опционально
+  }
+  next();
 }
 
 // ========================= HEALTH =========================
@@ -562,17 +591,9 @@ app.post("/auth/telegram/unlink", requireAuth, async (req, res) => {
 
 
 
-app.post("/auth/logout", requireAuthFlex, async (req, res) => {
-  try {
-    const tgId = String(req.user.tg_id);
-    await pool.query(`update users set bot_enabled=false where tg_id=$1`, [tgId]);
-    // чистим httpOnly cookie (если используешь)
-    res.clearCookie("rp_jwt", { sameSite: "none", secure: true });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("logout failed:", e);
-    return res.status(500).json({ error: "internal" });
-  }
+app.post("/auth/logout", (req, res) => {
+  res.clearCookie("rp_jwt", { httpOnly: true, sameSite: "none", secure: true });
+  res.json({ ok: true });
 });
 
 
@@ -667,7 +688,7 @@ app.get("/recipes/:id/exists", async (req, res) => {
 // =====================================================================
 
 // список локальных рецептов владельца
-app.get("/local/recipes", async (req, res) => {
+app.get("/local/recipes", optionalAuth, async (req, res) => {
   const owner = getOwner(req);
   if (!owner) return res.status(400).json({ error: "owner required" });
 
@@ -680,7 +701,7 @@ app.get("/local/recipes", async (req, res) => {
 });
 
 // один
-app.get("/local/recipes/:id", async (req, res) => {
+app.get("/local/recipes/:id", optionalAuth, async (req, res) => {
   const owner = getOwner(req);
   if (!owner) return res.status(400).json({ error: "owner required" });
 
@@ -693,7 +714,7 @@ app.get("/local/recipes/:id", async (req, res) => {
 });
 
 // upsert
-app.put("/local/recipes/:id", async (req, res) => {
+app.put("/local/recipes/:id", optionalAuth, async (req, res) => {
   const owner = getOwner(req);
   if (!owner) return res.status(400).json({ error: "owner required" });
 
@@ -714,7 +735,7 @@ app.put("/local/recipes/:id", async (req, res) => {
 });
 
 // удалить локальный рецепт
-app.delete("/local/recipes/:id", async (req, res) => {
+app.delete("/local/recipes/:id", optionalAuth, async (req, res) => {
   const owner = getOwner(req);
   if (!owner) return res.status(400).json({ error: "owner required" });
 
@@ -726,7 +747,7 @@ app.delete("/local/recipes/:id", async (req, res) => {
 });
 
 // массовая загрузка локальных рецептов
-app.post("/local/recipes/bulk", async (req, res) => {
+app.post("/local/recipes/bulk", optionalAuth, async (req, res) => {
   const owner = getOwner(req);
   if (!owner) return res.status(400).json({ error: "owner required" });
 
