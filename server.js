@@ -816,6 +816,124 @@ app.post("/local/recipes/migrate", requireAuth, async (req, res) => {
   }
 });
 
+
+
+
+
+
+
+
+// ===== SYNC (двусторонний) ============================================
+app.post("/local/recipes/sync", optionalAuth, async (req, res) => {
+  try {
+    const owner = getOwner(req);
+    if (!owner) return res.status(400).json({ error: "owner required" });
+
+    const payload = req.body || {};
+    const clientItems = Array.isArray(payload.client) ? payload.client : [];
+
+    // стянем все рецепты владельца
+    const { rows } = await pool.query(
+      `select id, data, extract(epoch from updated_at)*1000 as updated_ms
+         from local_recipes
+        where owner=$1`,
+      [owner]
+    );
+
+    const serverMap = new Map(
+      rows.map(r => [r.id, { id: r.id, data: r.data, updated_ms: Number(r.updated_ms) }])
+    );
+
+    // индекс клиента
+    const clientMap = new Map(
+      clientItems.map(c => [
+        String(c.id),
+        {
+          id: String(c.id),
+          // клиент может прислать updatedAt в дата/числе/строке
+          updated_ms: Number(
+            c.updated_ms ??
+            c.updatedAt ??
+            c.updated_at ??
+            (c.data?.updatedAt ?? c.data?.updated_at) ??
+            0
+          ),
+          data: c.data ?? null, // если прислали полные данные — можно пушить
+        },
+      ])
+    );
+
+    // 1) сервер <- клиент (push новее)
+    const clientPush = [];
+    for (const [id, c] of clientMap) {
+      const s = serverMap.get(id);
+      // если клиент думает, что у него свежая версия и дал data — апсертим
+      if (c.data && (!s || c.updated_ms > (s.updated_ms || 0))) {
+        clientPush.push({ id, data: c.data });
+      }
+    }
+
+    if (clientPush.length) {
+      const client = await pool.connect();
+      try {
+        await client.query("begin");
+        for (const { id, data } of clientPush) {
+          // запишем updated_at = now(), а в data — положим id и updatedAt для наглядности
+          const normalized = { ...data, id, updatedAt: Date.now() };
+          await client.query(
+            `insert into local_recipes (owner, id, data)
+             values ($1,$2,$3)
+             on conflict (owner,id)
+             do update set data=excluded.data, updated_at=now()`,
+            [owner, id, normalized]
+          );
+        }
+        await client.query("commit");
+      } catch (e) {
+        await client.query("rollback");
+        console.error("sync push failed:", e);
+        return res.status(500).json({ error: "internal" });
+      } finally {
+        client.release();
+      }
+    }
+
+    // пересчитаем серверное состояние после возможных апсертов
+    const { rows: rows2 } = await pool.query(
+      `select id, data, extract(epoch from updated_at)*1000 as updated_ms
+         from local_recipes
+        where owner=$1`,
+      [owner]
+    );
+    const serverNow = new Map(
+      rows2.map(r => [r.id, { id: r.id, data: r.data, updated_ms: Number(r.updated_ms) }])
+    );
+
+    // 2) клиент <- сервер: отдаём всё, что у клиента нет или стало новее на сервере
+    const pull = [];
+    for (const [id, s] of serverNow) {
+      const c = clientMap.get(id);
+      if (!c || s.updated_ms > (c.updated_ms || 0)) {
+        pull.push({ id, ...s.data, idForced: id }); // idForced — на случай, если в data нет id
+      }
+    }
+
+    // 3) удалить на клиенте то, чего больше нет на сервере (клиент прислал, а на сервере нет)
+    const remove = [];
+    for (const [id] of clientMap) {
+      if (!serverNow.has(id)) remove.push(id);
+    }
+
+    res.json({ ok: true, pull, remove });
+  } catch (e) {
+    console.error("/local/recipes/sync error:", e);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+
+
+
 // =====================================================================
 // ========================== ЗАКАЗЫ (Telegram) =========================
 // =====================================================================
